@@ -4,16 +4,20 @@ import datetime as dt
 import logging
 import os
 import re
+import urllib.parse
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, replace
-from typing import Optional, List, Dict, Tuple, Iterable
+from typing import Optional, List, Dict, Tuple
 
 import aiohttp
 import discord
 from discord import app_commands
 
-__version__ = "0.3.0"
+__version__ = "0.3.1"
 
+# =========================
+# Env / Config
+# =========================
 DISCORD_TOKEN = (os.environ.get("PLEXBOT_DISCORD_TOKEN") or "").strip()
 GUILD_ID = (os.environ.get("PLEXBOT_GUILD_ID") or "").strip()
 
@@ -26,10 +30,16 @@ HISTORY_PAGE_SIZE = int(os.environ.get("PLEXBOT_HISTORY_PAGE_SIZE") or "200")
 if not DISCORD_TOKEN:
     raise RuntimeError("PLEXBOT_DISCORD_TOKEN manquant (variable d’environnement Windows).")
 
+# =========================
+# Logging
+# =========================
 logging.basicConfig(level=logging.INFO, format="[%(asctime)s] %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("PlexBot")
 
 
+# =========================
+# Helpers
+# =========================
 def _safe(text: str | None) -> str:
     return (text or "").strip()
 
@@ -64,21 +74,30 @@ def _header(title: str) -> str:
     return f"{title}  _(v{__version__})_"
 
 
+# =========================
+# Plex HTTP
+# =========================
 async def _plex_get_xml(path: str) -> ET.Element:
     if not PLEX_TOKEN:
         raise RuntimeError("PLEXBOT_PLEX_TOKEN manquant (variable d’environnement Windows).")
+
     url = f"{PLEX_BASE_URL}{path}"
     sep = "&" if "?" in url else "?"
     url = f"{url}{sep}X-Plex-Token={PLEX_TOKEN}"
+
     async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=18)) as session:
         async with session.get(url) as resp:
             if resp.status != 200:
                 body = await resp.text()
                 raise RuntimeError(f"Plex HTTP {resp.status}: {body[:200]}")
             xml_text = await resp.text()
+
     return ET.fromstring(xml_text)
 
 
+# =========================
+# Plex: sections / now playing
+# =========================
 async def fetch_library_sections() -> List[Dict[str, str]]:
     root = await _plex_get_xml("/library/sections")
     out: List[Dict[str, str]] = []
@@ -101,12 +120,14 @@ def _match_section(query: str, section: Dict[str, str]) -> bool:
 async def fetch_plex_sessions() -> list[dict]:
     root = await _plex_get_xml("/status/sessions")
     sessions: list[dict] = []
+
     for v in root.findall("./Video"):
         media_type = _safe(v.get("type"))
         title = _safe(v.get("title"))
         show = _safe(v.get("grandparentTitle"))
         season = v.get("parentIndex")
         ep = v.get("index")
+
         user_el = v.find("./User")
         user = _safe(user_el.get("title") if user_el is not None else "")
 
@@ -141,16 +162,20 @@ async def fetch_plex_sessions() -> list[dict]:
                 "quality": " ".join(x for x in [resolution, (vcodec.upper() if vcodec else ""), container] if x).strip(),
             }
         )
+
     return sessions
 
 
+# =========================
+# Plex: recently added (smart collapsing)
+# =========================
 @dataclass(frozen=True)
 class RecentItem:
     added_at: int
     line: str
     section_title: str
     section_id: str
-    kind: str
+    kind: str  # movie/episode/season
     season_key: str = ""
     episode_parent_season_key: str = ""
     show_title: str = ""
@@ -315,6 +340,9 @@ async def fetch_recently_added(limit: int = 10, library: Optional[str] = None) -
     return out
 
 
+# =========================
+# Plex: library stats
+# =========================
 async def fetch_library_stats() -> List[Tuple[str, int]]:
     sections = await fetch_library_sections()
     stats: List[Tuple[str, int]] = []
@@ -330,6 +358,9 @@ async def fetch_library_stats() -> List[Tuple[str, int]]:
     return stats
 
 
+# =========================
+# Plex: search (FIXED)
+# =========================
 def _format_search_hit(el: ET.Element) -> Optional[str]:
     tag = el.tag.lower()
     media_type = _safe(el.get("type"))
@@ -372,28 +403,61 @@ async def plex_search(query: str, limit: int = 10, library: Optional[str] = None
     query = (query or "").strip()
     if not query:
         return []
+
     library_norm = _norm(library or "") if library else ""
-    root = await _plex_get_xml(f"/search?query={aiohttp.helpers.quote(query)}&X-Plex-Container-Size=50")
+    q = urllib.parse.quote(query)
+
+    # Plex UI uses hubs search (more reliable than /search for many servers)
+    root = await _plex_get_xml(f"/hubs/search?query={q}&X-Plex-Container-Size=50")
+
     hits: List[str] = []
     seen: set[str] = set()
-    for el in list(root):
-        if library_norm:
-            section = _safe(el.get("librarySectionTitle"))
-            if library_norm not in _norm(section):
+
+    # /hubs/search returns <Hub> nodes; items are nested under each hub.
+    for hub in root.findall("./Hub"):
+        for el in list(hub):
+            if library_norm:
+                section = _safe(el.get("librarySectionTitle"))
+                if library_norm not in _norm(section):
+                    continue
+
+            line = _format_search_hit(el)
+            if not line:
                 continue
-        line = _format_search_hit(el)
-        if not line:
-            continue
-        key = line.lower()
-        if key in seen:
-            continue
-        seen.add(key)
-        hits.append(line)
-        if len(hits) >= limit:
-            break
+
+            key = line.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            hits.append(line)
+            if len(hits) >= limit:
+                return hits
+
+    # Fallback: also try /search if hubs returns nothing
+    if not hits:
+        root2 = await _plex_get_xml(f"/search?query={q}&X-Plex-Container-Size=50")
+        for el in list(root2):
+            if library_norm:
+                section = _safe(el.get("librarySectionTitle"))
+                if library_norm not in _norm(section):
+                    continue
+            line = _format_search_hit(el)
+            if not line:
+                continue
+            key = line.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            hits.append(line)
+            if len(hits) >= limit:
+                break
+
     return hits
 
 
+# =========================
+# Plex: history-based stats (best-effort)
+# =========================
 async def _fetch_history_page(start: int, size: int) -> ET.Element:
     return await _plex_get_xml(f"/status/sessions/history/all?X-Plex-Container-Start={start}&X-Plex-Container-Size={size}")
 
@@ -414,11 +478,18 @@ async def fetch_activity(days: int = 1) -> Dict[str, object]:
         for v in items:
             viewed_at = _to_int(v.get("viewedAt"))
             if viewed_at and viewed_at < cutoff:
-                return {"streams": total_streams, "unique_users": len(users), "top_title": max(titles.items(), key=lambda x: x[1])[0] if titles else None, "days": days}
+                return {
+                    "streams": total_streams,
+                    "unique_users": len(users),
+                    "top_title": max(titles.items(), key=lambda x: x[1])[0] if titles else None,
+                    "days": days,
+                }
+
             total_streams += 1
             user_el = v.find("./User")
             user = _safe(user_el.get("title") if user_el is not None else "") or "Unknown"
             users[user] = users.get(user, 0) + 1
+
             media_type = _safe(v.get("type"))
             if media_type == "episode":
                 show = _safe(v.get("grandparentTitle")) or "Unknown"
@@ -426,10 +497,17 @@ async def fetch_activity(days: int = 1) -> Dict[str, object]:
             else:
                 title = _safe(v.get("title")) or "Unknown"
                 titles[title] = titles.get(title, 0) + 1
+
         start += size
         if start >= 3000:
             break
-    return {"streams": total_streams, "unique_users": len(users), "top_title": max(titles.items(), key=lambda x: x[1])[0] if titles else None, "days": days}
+
+    return {
+        "streams": total_streams,
+        "unique_users": len(users),
+        "top_title": max(titles.items(), key=lambda x: x[1])[0] if titles else None,
+        "days": days,
+    }
 
 
 async def fetch_top_users(days: int = 30, limit: int = 10) -> List[Tuple[str, int]]:
@@ -437,6 +515,7 @@ async def fetch_top_users(days: int = 30, limit: int = 10) -> List[Tuple[str, in
     start = 0
     size = max(50, min(500, HISTORY_PAGE_SIZE))
     counts: Dict[str, int] = {}
+
     while True:
         root = await _fetch_history_page(start, size)
         items = root.findall("./Video")
@@ -452,9 +531,13 @@ async def fetch_top_users(days: int = 30, limit: int = 10) -> List[Tuple[str, in
         start += size
         if start >= 5000:
             break
+
     return sorted(counts.items(), key=lambda x: x[1], reverse=True)[:limit]
 
 
+# =========================
+# Discord bot
+# =========================
 class PlexBot(discord.Client):
     def __init__(self) -> None:
         super().__init__(intents=discord.Intents.default())
@@ -475,6 +558,9 @@ class PlexBot(discord.Client):
 bot = PlexBot()
 
 
+# =========================
+# Slash commands
+# =========================
 @bot.tree.command(name="plex_ping", description="Test PlexBot")
 async def plex_ping(interaction: discord.Interaction):
     await interaction.response.send_message(_header("🏓 PlexBot Pong ✅"), ephemeral=True)
