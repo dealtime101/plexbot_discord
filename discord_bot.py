@@ -14,7 +14,7 @@ import aiohttp
 import discord
 from discord import app_commands
 
-__version__ = "0.4.0"
+__version__ = "0.4.1"
 
 # =========================
 # Env / Config
@@ -52,6 +52,15 @@ def _to_int(s: str | None, default: int = 0) -> int:
         return default
 
 
+def _to_float(s: str | None) -> Optional[float]:
+    try:
+        if s is None:
+            return None
+        return float(str(s).strip())
+    except Exception:
+        return None
+
+
 def _fmt_ms(ms: int) -> str:
     if ms <= 0:
         return "0:00"
@@ -79,11 +88,24 @@ def _plex_url(path: str) -> str:
     """Build a Plex URL (with token) for relative paths like /library/metadata/..."""
     if not path:
         return ""
-    # Sometimes thumb/art comes without leading slash
     p = path if path.startswith("/") else ("/" + path)
     url = f"{PLEX_BASE_URL}{p}"
     sep = "&" if "?" in url else "?"
     return f"{url}{sep}X-Plex-Token={PLEX_TOKEN}"
+
+
+def _rating_badge(r10: Optional[float]) -> Optional[str]:
+    """Return '8.3 / 10  ⭐⭐⭐⭐☆' (5-star w/ half using ✨)."""
+    if r10 is None:
+        return None
+    r10 = max(0.0, min(10.0, float(r10)))
+    r5 = r10 / 2.0
+    r5r = round(r5 * 2) / 2.0  # nearest 0.5
+    full = int(r5r)
+    half = 1 if (r5r - full) >= 0.5 else 0
+    empty = max(0, 5 - full - half)
+    stars = "⭐" * full + ("✨" if half else "") + "☆" * empty
+    return f"{r10:.1f} / 10  {stars}"
 
 
 # =========================
@@ -412,7 +434,6 @@ def _format_search_hit(el: ET.Element) -> Optional[str]:
 
 
 async def plex_search(query: str, limit: int = 10, library: Optional[str] = None) -> List[ET.Element]:
-    """Returns raw Plex elements (Video/Directory) for best hits."""
     query = (query or "").strip()
     if not query:
         return []
@@ -442,7 +463,6 @@ async def plex_search(query: str, limit: int = 10, library: Optional[str] = None
             if len(hits) >= limit:
                 return hits
 
-    # fallback
     root2 = await _plex_get_xml(f"/search?query={q}&X-Plex-Container-Size=50")
     for el in list(root2):
         if library_norm:
@@ -463,14 +483,10 @@ async def plex_search(query: str, limit: int = 10, library: Optional[str] = None
     return hits
 
 
-# =========================
-# Plex: info / metadata
-# =========================
 def _pick_best_search_hit(query: str, hits: List[ET.Element]) -> Optional[ET.Element]:
     if not hits:
         return None
     qn = _norm(query)
-    # Prefer show/movie with exact-ish title match
     best = None
     best_score = -1
     for el in hits:
@@ -496,66 +512,72 @@ async def fetch_metadata(rating_key: str) -> Optional[ET.Element]:
     if not rating_key:
         return None
     root = await _plex_get_xml(f"/library/metadata/{rating_key}")
-    # Usually first child is Video/Directory
     for child in list(root):
         return child
     return None
 
 
-def _metadata_to_embed(el: ET.Element) -> discord.Embed:
+def _ensure_library_field(embed: discord.Embed, section: str | None) -> None:
+    if not section:
+        return
+    for f in embed.fields:
+        if (f.name or "").lower().endswith("library"):
+            return
+    embed.add_field(name="📚 Library", value=section, inline=True)
+
+
+def _metadata_to_embed(el: ET.Element, *, title_override: Optional[str] = None, library_override: Optional[str] = None) -> discord.Embed:
     mtype = _safe(el.get("type"))
     title = _safe(el.get("title"))
     year = _safe(el.get("year"))
-    section = _safe(el.get("librarySectionTitle"))
+    section = library_override or _safe(el.get("librarySectionTitle"))
+
+    display = f"{title} ({year})" if year else title
 
     if mtype == "show":
-        display = f"{title} ({year})" if year else title
-        embed = discord.Embed(title=f"📺 Plex — Info  _(v{__version__})_", description=f"**{display}**")
-        embed.add_field(name="Library", value=section or "n/a", inline=True)
+        embed = discord.Embed(title=title_override or f"📺 Plex — Info  _(v{__version__})_", description=f"**{display}**")
+        _ensure_library_field(embed, section or None)
         seasons = _safe(el.get("childCount"))
         episodes = _safe(el.get("leafCount"))
         if seasons:
-            embed.add_field(name="Seasons", value=seasons, inline=True)
+            embed.add_field(name="📦 Seasons", value=seasons, inline=True)
         if episodes:
-            embed.add_field(name="Episodes", value=episodes, inline=True)
-
+            embed.add_field(name="🎞️ Episodes", value=episodes, inline=True)
     else:
-        # movie or other
-        display = f"{title} ({year})" if year else title
         emoji = "🎬" if mtype == "movie" else "🎞️"
-        embed = discord.Embed(title=f"{emoji} Plex — Info  _(v{__version__})_", description=f"**{display}**")
-        embed.add_field(name="Library", value=section or "n/a", inline=True)
+        embed = discord.Embed(title=title_override or f"{emoji} Plex — Info  _(v{__version__})_", description=f"**{display}**")
+        _ensure_library_field(embed, section or None)
         if mtype:
-            embed.add_field(name="Type", value=mtype, inline=True)
+            embed.add_field(name="🏷️ Type", value=mtype, inline=True)
 
-    # Rating (audienceRating is common)
-    rating = _safe(el.get("audienceRating")) or _safe(el.get("rating"))
-    if rating:
-        embed.add_field(name="Rating", value=str(rating), inline=True)
+    rating_raw = _safe(el.get("audienceRating")) or _safe(el.get("rating"))
+    rating = _to_float(rating_raw)
+    badge = _rating_badge(rating)
+    if badge:
+        embed.add_field(name="⭐ Rating", value=badge, inline=True)
 
-    # Genres
     genres = [g.get("tag") for g in el.findall("./Genre") if g.get("tag")]
     if genres:
-        embed.add_field(name="Genres", value=", ".join(genres)[:1024], inline=False)
+        embed.add_field(name="🎭 Genres", value=", ".join(genres)[:1024], inline=False)
 
-    # Summary
     summary = _safe(el.get("summary"))
     if summary:
-        # Discord field value max 1024; use description extension instead
-        embed.add_field(name="Summary", value=summary[:1024], inline=False)
+        embed.add_field(name="📝 Summary", value=summary[:1024], inline=False)
 
-    # Poster/thumb
-    thumb = _safe(el.get("thumb")) or _safe(el.get("art"))
+    thumb = _safe(el.get("thumb"))
+    art = _safe(el.get("art"))
+
     if thumb and PLEX_TOKEN:
-        embed.set_thumbnail(url=_plex_url(thumb))
+        poster_url = _plex_url(thumb)
+        embed.set_image(url=poster_url)
+        embed.set_thumbnail(url=poster_url)
+    elif art and PLEX_TOKEN:
+        embed.set_image(url=_plex_url(art))
 
     embed.set_footer(text=f"PlexBot v{__version__}")
     return embed
 
 
-# =========================
-# Plex: onDeck
-# =========================
 def _format_ondeck_item(el: ET.Element) -> str:
     mtype = _safe(el.get("type"))
     if mtype == "episode":
@@ -582,7 +604,6 @@ async def fetch_ondeck(limit: int = 10, library: Optional[str] = None) -> List[s
         ln = _norm(library)
         items = [x for x in items if ln in _norm(_safe(x.get("librarySectionTitle")))]
 
-    # Sort by addedAt/updatedAt if available (otherwise keep order)
     def _sort_key(x: ET.Element) -> int:
         return _to_int(x.get("updatedAt"), _to_int(x.get("addedAt"), 0))
 
@@ -596,11 +617,11 @@ async def fetch_ondeck(limit: int = 10, library: Optional[str] = None) -> List[s
     return out
 
 
-# =========================
-# Plex: random
-# =========================
-async def fetch_random_item(library: Optional[str] = None) -> Optional[ET.Element]:
+async def fetch_random_item(library: Optional[str] = None) -> Tuple[Optional[ET.Element], Optional[str]]:
     sections = await fetch_library_sections()
+    if not sections:
+        return None, None
+
     if library:
         matched = [s for s in sections if _match_section(library, s)]
         if not matched:
@@ -608,99 +629,17 @@ async def fetch_random_item(library: Optional[str] = None) -> Optional[ET.Elemen
             raise RuntimeError(f"Aucune bibliothèque trouvée pour '{library}'. Ex: {examples}")
         section = random.choice(matched)
     else:
-        # pick a random library (prefer video libraries)
-        video_sections = [s for s in sections if (s.get("type") in ("movie", "show") or s.get("type"))]
-        section = random.choice(video_sections or sections)
+        section = random.choice(sections)
 
     sid = section.get("id")
+    stitle = section.get("title")
     if not sid:
-        return None
+        return None, stitle
 
-    # Plex supports sort=random
     root = await _plex_get_xml(f"/library/sections/{sid}/all?sort=random&X-Plex-Container-Start=0&X-Plex-Container-Size=1")
     for child in list(root):
-        return child
-    return None
-
-
-# =========================
-# Plex: history-based stats (best-effort)
-# =========================
-async def _fetch_history_page(start: int, size: int) -> ET.Element:
-    return await _plex_get_xml(f"/status/sessions/history/all?X-Plex-Container-Start={start}&X-Plex-Container-Size={size}")
-
-
-async def fetch_activity(days: int = 1) -> Dict[str, object]:
-    cutoff = int((dt.datetime.utcnow() - dt.timedelta(days=days)).timestamp())
-    start = 0
-    size = max(50, min(500, HISTORY_PAGE_SIZE))
-    total_streams = 0
-    users: Dict[str, int] = {}
-    titles: Dict[str, int] = {}
-
-    while True:
-        root = await _fetch_history_page(start, size)
-        items = root.findall("./Video")
-        if not items:
-            break
-        for v in items:
-            viewed_at = _to_int(v.get("viewedAt"))
-            if viewed_at and viewed_at < cutoff:
-                return {
-                    "streams": total_streams,
-                    "unique_users": len(users),
-                    "top_title": max(titles.items(), key=lambda x: x[1])[0] if titles else None,
-                    "days": days,
-                }
-
-            total_streams += 1
-            user_el = v.find("./User")
-            user = _safe(user_el.get("title") if user_el is not None else "") or "Unknown"
-            users[user] = users.get(user, 0) + 1
-
-            media_type = _safe(v.get("type"))
-            if media_type == "episode":
-                show = _safe(v.get("grandparentTitle")) or "Unknown"
-                titles[show] = titles.get(show, 0) + 1
-            else:
-                title = _safe(v.get("title")) or "Unknown"
-                titles[title] = titles.get(title, 0) + 1
-
-        start += size
-        if start >= 3000:
-            break
-
-    return {
-        "streams": total_streams,
-        "unique_users": len(users),
-        "top_title": max(titles.items(), key=lambda x: x[1])[0] if titles else None,
-        "days": days,
-    }
-
-
-async def fetch_top_users(days: int = 30, limit: int = 10) -> List[Tuple[str, int]]:
-    cutoff = int((dt.datetime.utcnow() - dt.timedelta(days=days)).timestamp())
-    start = 0
-    size = max(50, min(500, HISTORY_PAGE_SIZE))
-    counts: Dict[str, int] = {}
-
-    while True:
-        root = await _fetch_history_page(start, size)
-        items = root.findall("./Video")
-        if not items:
-            break
-        for v in items:
-            viewed_at = _to_int(v.get("viewedAt"))
-            if viewed_at and viewed_at < cutoff:
-                return sorted(counts.items(), key=lambda x: x[1], reverse=True)[:limit]
-            user_el = v.find("./User")
-            user = _safe(user_el.get("title") if user_el is not None else "") or "Unknown"
-            counts[user] = counts.get(user, 0) + 1
-        start += size
-        if start >= 5000:
-            break
-
-    return sorted(counts.items(), key=lambda x: x[1], reverse=True)[:limit]
+        return child, stitle
+    return None, stitle
 
 
 # =========================
@@ -726,9 +665,6 @@ class PlexBot(discord.Client):
 bot = PlexBot()
 
 
-# =========================
-# Slash commands
-# =========================
 @bot.tree.command(name="plex_ping", description="Test PlexBot")
 async def plex_ping(interaction: discord.Interaction):
     await interaction.response.send_message(_header("🏓 PlexBot Pong ✅"), ephemeral=True)
@@ -753,20 +689,15 @@ async def plex_help(interaction: discord.Interaction):
             "• `/plex_playing` — Now playing sessions",
             "• `/plex_recent` — Recently added (library filter + season collapse)",
             "• `/plex_search` — Search in Plex",
-            "• `/plex_info` — Info (poster + summary)",
+            "• `/plex_info` — Info (poster + rating stars)",
             "• `/plex_random` — Random pick (optional library)",
             "• `/plex_ondeck` — Continue watching / On Deck",
             "• `/plex_library_stats` — Library item counts",
-            "• `/plex_activity` — Activity stats (history)",
-            "• `/plex_users` — Top users (history)",
             "• `/plex_version` — Bot version",
             "• `/plex_ping` — Bot ping",
             "",
             "**Tips**",
             f"• Season collapse: ≥ **{RECENT_SEASON_COLLAPSE_THRESHOLD} eps**",
-            "• Example: `/plex_recent library:\"TV Shows\" limit:15`",
-            "• Example: `/plex_info query:\"one punch man\"`",
-            "• Example: `/plex_random library:Anime`",
         ]
     )
     embed = discord.Embed(title="🎬 Plex — Help", description=desc)
@@ -774,210 +705,8 @@ async def plex_help(interaction: discord.Interaction):
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
-@bot.tree.command(name="plex_playing", description="Affiche ce qui joue présentement sur Plex")
-async def plex_playing(interaction: discord.Interaction):
-    await interaction.response.defer(ephemeral=True)
-    try:
-        sessions = await fetch_plex_sessions()
-    except Exception as e:
-        await interaction.followup.send(f"{_header('❌ Plex — Error')}\n\nErreur Plex: {e}", ephemeral=True)
-        return
-    if not sessions:
-        await interaction.followup.send(f"{_header('🎬 Plex — Now Playing')}\n\nAucune lecture en cours sur Plex.", ephemeral=True)
-        return
-
-    lines = [_header("🎬 Plex — Now Playing")]
-    for s in sessions[:10]:
-        lines.append(
-            f"\n**{s['user']}** — {_pretty_state(s['state'])}\n"
-            f"🎞️ {s['title']}\n"
-            f"⏱️ {s['progress']}\n"
-            f"📺 {s['quality'] or 'n/a'}"
-        )
-    msg = "\n".join(lines)
-    await interaction.followup.send(msg[:1900] + ("\n…(tronqué)" if len(msg) > 1900 else ""), ephemeral=True)
-
-
-@bot.tree.command(name="plex_recent", description="Affiche les derniers ajouts Plex (option: bibliothèque)")
-@app_commands.describe(library="Nom ou ID de bibliothèque (ex: Movies, TV Shows, Anime)", limit="Nombre d’items (1-15)")
-async def plex_recent(interaction: discord.Interaction, library: Optional[str] = None, limit: Optional[int] = 10):
-    await interaction.response.defer(ephemeral=True)
-    try:
-        n = int(limit) if limit is not None else 10
-    except Exception:
-        n = 10
-    n = max(1, min(15, n))
-
-    try:
-        items = await fetch_recently_added(limit=n, library=library)
-    except Exception as e:
-        await interaction.followup.send(f"{_header('❌ Plex — Error')}\n\nErreur Plex: {e}", ephemeral=True)
-        return
-
-    title = _header("🆕 Plex — Recently Added")
-    if library:
-        title += f" _(filter: {library})_"
-    title += f" _(collapse≥{RECENT_SEASON_COLLAPSE_THRESHOLD} eps)_"
-
-    if not items:
-        await interaction.followup.send(f"{title}\n\nAucun élément récent trouvé.", ephemeral=True)
-        return
-
-    msg = "\n".join([title, *[f"• {it}" for it in items]])
-    await interaction.followup.send(msg[:1900] + ("\n…(tronqué)" if len(msg) > 1900 else ""), ephemeral=True)
-
-
-@plex_recent.autocomplete("library")
-async def plex_recent_library_autocomplete(interaction: discord.Interaction, current: str):
-    try:
-        sections = await fetch_library_sections()
-    except Exception:
-        return []
-    q = (current or "").strip()
-    choices = []
-    for s in sections:
-        title = s.get("title", "")
-        sid = s.get("id", "")
-        if not title:
-            continue
-        if not q or _norm(q) in _norm(title) or (sid and q.strip() in sid):
-            label = f"{title} ({sid})" if sid else title
-            choices.append(app_commands.Choice(name=label[:100], value=title[:100]))
-        if len(choices) >= 25:
-            break
-    return choices
-
-
-@bot.tree.command(name="plex_library_stats", description="Affiche le nombre d’éléments par bibliothèque")
-async def plex_library_stats(interaction: discord.Interaction):
-    await interaction.response.defer(ephemeral=True)
-    try:
-        stats = await fetch_library_stats()
-    except Exception as e:
-        await interaction.followup.send(f"{_header('❌ Plex — Error')}\n\nErreur Plex: {e}", ephemeral=True)
-        return
-    msg = "\n".join([_header("📚 Plex — Library Stats"), *[f"• **{t}**: {c}" for t, c in stats]])
-    await interaction.followup.send(msg[:1900] + ("\n…(tronqué)" if len(msg) > 1900 else ""), ephemeral=True)
-
-
-@bot.tree.command(name="plex_search", description="Recherche dans Plex (option: bibliothèque)")
-@app_commands.describe(query="Texte à chercher", library="Optionnel: nom de bibliothèque", limit="Nombre de résultats (1-15)")
-async def plex_search_cmd(interaction: discord.Interaction, query: str, library: Optional[str] = None, limit: Optional[int] = 10):
-    await interaction.response.defer(ephemeral=True)
-    try:
-        n = int(limit) if limit is not None else 10
-    except Exception:
-        n = 10
-    n = max(1, min(15, n))
-
-    try:
-        hits_raw = await plex_search(query=query, limit=50, library=library)
-    except Exception as e:
-        await interaction.followup.send(f"{_header('❌ Plex — Error')}\n\nErreur Plex: {e}", ephemeral=True)
-        return
-
-    title = _header("🔎 Plex — Search")
-    if library:
-        title += f" _(filter: {library})_"
-    title += f"\nQuery: **{query}**"
-
-    if not hits_raw:
-        await interaction.followup.send(f"{title}\n\nAucun résultat.", ephemeral=True)
-        return
-
-    lines = [title, ""]
-    count = 0
-    for el in hits_raw:
-        line = _format_search_hit(el)
-        if not line:
-            continue
-        lines.append(f"• {line}")
-        count += 1
-        if count >= n:
-            break
-
-    await interaction.followup.send("\n".join(lines)[:1900], ephemeral=True)
-
-
-@plex_search_cmd.autocomplete("library")
-async def plex_search_library_autocomplete(interaction: discord.Interaction, current: str):
-    return await plex_recent_library_autocomplete(interaction, current)
-
-
-@bot.tree.command(name="plex_activity", description="Stats d’activité Plex (best-effort, basé sur l’historique)")
-@app_commands.describe(days="Fenêtre en jours (1-30)")
-async def plex_activity_cmd(interaction: discord.Interaction, days: Optional[int] = 1):
-    await interaction.response.defer(ephemeral=True)
-    try:
-        d = int(days or 1)
-    except Exception:
-        d = 1
-    d = max(1, min(30, d))
-
-    try:
-        info = await fetch_activity(days=d)
-    except Exception as e:
-        await interaction.followup.send(
-            f"{_header('❌ Plex — Error')}\n\nErreur Plex (history): {e}\n\n"
-            "Note: `history/all` peut être désactivé selon le serveur/token.",
-            ephemeral=True,
-        )
-        return
-
-    lines = [
-        _header("📊 Plex — Activity"),
-        f"• Window: **{info['days']} day(s)**",
-        f"• Streams: **{info['streams']}**",
-        f"• Unique users: **{info['unique_users']}**",
-    ]
-    if info.get("top_title"):
-        lines.append(f"• Top title: **{info['top_title']}**")
-    await interaction.followup.send("\n".join(lines), ephemeral=True)
-
-
-@bot.tree.command(name="plex_users", description="Top utilisateurs Plex (best-effort, basé sur l’historique)")
-@app_commands.describe(days="Fenêtre en jours (1-90)", limit="Nombre d’utilisateurs (1-15)")
-async def plex_users_cmd(interaction: discord.Interaction, days: Optional[int] = 30, limit: Optional[int] = 10):
-    await interaction.response.defer(ephemeral=True)
-    try:
-        d = int(days or 30)
-    except Exception:
-        d = 30
-    d = max(1, min(90, d))
-
-    try:
-        n = int(limit) if limit is not None else 10
-    except Exception:
-        n = 10
-    n = max(1, min(15, n))
-
-    try:
-        top = await fetch_top_users(days=d, limit=n)
-    except Exception as e:
-        await interaction.followup.send(
-            f"{_header('❌ Plex — Error')}\n\nErreur Plex (history): {e}\n\n"
-            "Note: `history/all` peut être désactivé selon le serveur/token.",
-            ephemeral=True,
-        )
-        return
-
-    if not top:
-        await interaction.followup.send(f"{_header('👥 Plex — Top Users')}\n\nAucune donnée.", ephemeral=True)
-        return
-
-    lines = [_header("👥 Plex — Top Users"), f"• Window: **{d} day(s)**", ""]
-    for i, (user, plays) in enumerate(top, start=1):
-        lines.append(f"{i}. **{user}** — {plays} plays")
-
-    msg = "\n".join(lines)
-    await interaction.followup.send(msg[:1900] + ("\n…(tronqué)" if len(msg) > 1900 else ""), ephemeral=True)
-
-
-# =========================
-# v0.4.0 commands
-# =========================
 @bot.tree.command(name="plex_info", description="Infos sur un film / série (poster, genres, summary)")
-@app_commands.describe(query="Titre à chercher", library="Optionnel: nom de bibliothèque (Anime, Movies, TV Shows...)")
+@app_commands.describe(query="Titre à chercher", library="Optionnel: nom de bibliothèque")
 async def plex_info_cmd(interaction: discord.Interaction, query: str, library: Optional[str] = None):
     await interaction.response.defer(ephemeral=True)
     try:
@@ -992,14 +721,12 @@ async def plex_info_cmd(interaction: discord.Interaction, query: str, library: O
 
     best = _pick_best_search_hit(query, hits)
     rating_key = _safe(best.get("ratingKey")) or ""
-    # Some nodes carry key like "/library/metadata/12345"
     if not rating_key:
         k = _safe(best.get("key"))
         m = re.search(r"/library/metadata/(\d+)", k or "")
         rating_key = m.group(1) if m else ""
 
     if not rating_key:
-        # fallback: show as simple line
         line = _format_search_hit(best) or "Résultat trouvé, mais impossible d’ouvrir le détail."
         await interaction.followup.send(f"{_header('ℹ️ Plex — Info')}\n\n{line}", ephemeral=True)
         return
@@ -1019,11 +746,11 @@ async def plex_info_cmd(interaction: discord.Interaction, query: str, library: O
 
 
 @bot.tree.command(name="plex_random", description="Choisit un item au hasard (option: bibliothèque)")
-@app_commands.describe(library="Optionnel: nom de bibliothèque",)
+@app_commands.describe(library="Optionnel: nom de bibliothèque")
 async def plex_random_cmd(interaction: discord.Interaction, library: Optional[str] = None):
     await interaction.response.defer(ephemeral=True)
     try:
-        el = await fetch_random_item(library=library)
+        el, section_title = await fetch_random_item(library=library)
     except Exception as e:
         await interaction.followup.send(f"{_header('❌ Plex — Error')}\n\nErreur Plex: {e}", ephemeral=True)
         return
@@ -1032,21 +759,7 @@ async def plex_random_cmd(interaction: discord.Interaction, library: Optional[st
         await interaction.followup.send(f"{_header('🎲 Plex — Random')}\n\nAucun résultat.", ephemeral=True)
         return
 
-    # If random returns an episode, try to show the parent show instead (nicer)
-    mtype = _safe(el.get("type"))
-    if mtype == "episode":
-        parent_key = _safe(el.get("grandparentRatingKey")) or _safe(el.get("grandparentKey"))
-        mk = re.search(r"/library/metadata/(\d+)", parent_key or "")
-        if mk:
-            try:
-                meta = await fetch_metadata(mk.group(1))
-                if meta is not None:
-                    el = meta
-            except Exception:
-                pass
-
-    embed = _metadata_to_embed(el)
-    embed.title = f"🎲 Plex — Random  _(v{__version__})_"
+    embed = _metadata_to_embed(el, title_override=f"🎲 Plex — Random  _(v{__version__})_", library_override=section_title)
     await interaction.followup.send(embed=embed, ephemeral=True)
 
 
