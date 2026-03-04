@@ -5,13 +5,14 @@ import logging
 import os
 import re
 import xml.etree.ElementTree as ET
+from dataclasses import dataclass
 from typing import Optional, List, Dict, Tuple
 
 import aiohttp
 import discord
 from discord import app_commands
 
-__version__ = "0.2.3"
+__version__ = "0.2.4"
 
 # =========================
 # Env / Config
@@ -115,7 +116,7 @@ def _match_section(query: str, section: Dict[str, str]) -> bool:
     if q.isdigit() and sid == q:
         return True
 
-    return q in _norm(title)  # space-insensitive match
+    return q in _norm(title)
 
 
 async def fetch_plex_sessions() -> list[dict]:
@@ -171,27 +172,40 @@ async def fetch_plex_sessions() -> list[dict]:
 
 
 # =========================
-# Plex: recently added (improved for TV Shows)
+# Plex: recently added (season-vs-episode logic)
 # =========================
-def _format_recent_item(el: ET.Element) -> Optional[Tuple[int, str]]:
+@dataclass(frozen=True)
+class RecentItem:
+    added_at: int
+    line: str
+    section_title: str
+    section_id: str
+    kind: str  # "season" | "episode" | "movie" | other
+    season_key: str = ""  # ratingKey of the season (for season items)
+    episode_parent_season_key: str = ""  # parentRatingKey of the episode (to suppress if season is present)
+
+
+def _format_recent_item(el: ET.Element) -> Optional[RecentItem]:
     """
-    Returns (addedAt, line) or None.
     Handles:
       - Video movie
       - Video episode
       - Directory season (TV libraries often show "Season 1" blocks)
-      - Directory show (rare but possible)
+      - Directory show (fallback)
     """
     added_at = int(el.get("addedAt") or "0")
     tag = el.tag.lower()
     media_type = _safe(el.get("type"))
+
+    section_title = _safe(el.get("librarySectionTitle"))
+    section_id = _safe(el.get("librarySectionID"))
 
     if tag == "video":
         if media_type == "movie":
             title = _safe(el.get("title"))
             year = _safe(el.get("year"))
             line = f"🎬 {title} ({year})" if year else f"🎬 {title}"
-            return (added_at, line)
+            return RecentItem(added_at, line, section_title, section_id, kind="movie")
 
         if media_type == "episode":
             show = _safe(el.get("grandparentTitle"))
@@ -206,8 +220,16 @@ def _format_recent_item(el: ET.Element) -> Optional[Tuple[int, str]]:
             except ValueError:
                 pass
 
+            parent_season_key = _safe(el.get("parentRatingKey"))  # season ratingKey
             line = f"📺 {show} — {se}{title}".strip()
-            return (added_at, line)
+            return RecentItem(
+                added_at,
+                line,
+                section_title,
+                section_id,
+                kind="episode",
+                episode_parent_season_key=parent_season_key,
+            )
 
         return None
 
@@ -216,33 +238,62 @@ def _format_recent_item(el: ET.Element) -> Optional[Tuple[int, str]]:
         if media_type == "season":
             show = _safe(el.get("parentTitle")) or _safe(el.get("grandparentTitle"))
             season_index = _safe(el.get("index"))
+            season_key = _safe(el.get("ratingKey")) or _safe(el.get("key"))
+
             if not show:
                 return None
+
             if season_index.isdigit():
                 line = f"📺 {show} — Season {int(season_index)}"
             else:
-                # fallback to title if index missing
                 season_title = _safe(el.get("title")) or "Season"
                 line = f"📺 {show} — {season_title}"
-            return (added_at, line)
+
+            return RecentItem(
+                added_at,
+                line,
+                section_title,
+                section_id,
+                kind="season",
+                season_key=season_key,
+            )
 
         if media_type == "show":
             title = _safe(el.get("title")) or _safe(el.get("name"))
             if not title:
                 return None
-            return (added_at, f"📺 {title}")
+            return RecentItem(added_at, f"📺 {title}", section_title, section_id, kind="show")
 
     return None
 
 
+def _apply_season_preference(items: List[RecentItem]) -> List[RecentItem]:
+    """
+    Rule (as requested):
+      - If a full season entry exists (Directory season), show the season entry.
+      - Hide individual episodes that belong to that season (parentRatingKey matches season ratingKey).
+      - If only episodes exist, show episodes.
+    This is applied per library section.
+    """
+    # Collect season keys per section
+    season_keys_by_section: Dict[str, set] = {}
+    for it in items:
+        if it.kind == "season" and it.season_key and it.section_id:
+            season_keys_by_section.setdefault(it.section_id, set()).add(it.season_key)
+
+    if not season_keys_by_section:
+        return items
+
+    filtered: List[RecentItem] = []
+    for it in items:
+        if it.kind == "episode" and it.section_id in season_keys_by_section:
+            if it.episode_parent_season_key and it.episode_parent_season_key in season_keys_by_section[it.section_id]:
+                continue  # season is present, suppress episodes from that season
+        filtered.append(it)
+    return filtered
+
+
 async def fetch_recently_added(limit: int = 10, library: Optional[str] = None) -> list[str]:
-    """
-    If library is provided:
-      - match library section(s) by name (space-insensitive) or id
-      - fetch /library/sections/<id>/recentlyAdded for better per-library results
-    Else:
-      - fetch global /library/recentlyAdded and label items with library name.
-    """
     sections = await fetch_library_sections()
 
     if library:
@@ -251,37 +302,43 @@ async def fetch_recently_added(limit: int = 10, library: Optional[str] = None) -
             examples = ", ".join(s["title"] for s in sections[:10] if s.get("title"))
             raise RuntimeError(f"Aucune bibliothèque trouvée pour '{library}'. Ex: {examples}")
 
-        # Pull per-section recentlyAdded, merge by addedAt
-        merged: List[Tuple[int, str]] = []
+        merged: List[RecentItem] = []
         for s in matched:
             sid = s.get("id")
             if not sid:
                 continue
-            root = await _plex_get_xml(f"/library/sections/{sid}/recentlyAdded?X-Plex-Container-Size=150")
+            root = await _plex_get_xml(f"/library/sections/{sid}/recentlyAdded?X-Plex-Container-Size=200")
             for child in list(root):
-                item = _format_recent_item(child)
-                if item:
-                    merged.append(item)
+                it = _format_recent_item(child)
+                if it:
+                    # section id/title may be missing in per-section results; fill them from section info
+                    if not it.section_id:
+                        it = RecentItem(it.added_at, it.line, it.section_title or s["title"], sid, it.kind, it.season_key, it.episode_parent_season_key)
+                    merged.append(it)
 
-        merged.sort(key=lambda x: x[0], reverse=True)
-        return [line for _, line in merged[:limit]]
+        merged.sort(key=lambda x: x.added_at, reverse=True)
+        merged = _apply_season_preference(merged)
+        return [it.line for it in merged[:limit]]
 
-    # No filter: global recentlyAdded + include library label
-    root = await _plex_get_xml("/library/recentlyAdded?X-Plex-Container-Size=200")
-    items: List[str] = []
+    # No filter: global recentlyAdded (already sorted by addedAt descending)
+    root = await _plex_get_xml("/library/recentlyAdded?X-Plex-Container-Size=250")
+    parsed: List[RecentItem] = []
     for child in list(root):
-        item = _format_recent_item(child)
-        if not item:
-            continue
-        _, line = item
-        section_title = _safe(child.get("librarySectionTitle"))
-        if section_title:
-            line = f"{line}  _( {section_title} )_"
-        items.append(line)
-        if len(items) >= limit:
-            break
+        it = _format_recent_item(child)
+        if it:
+            parsed.append(it)
 
-    return items
+    parsed = _apply_season_preference(parsed)
+
+    out: List[str] = []
+    for it in parsed:
+        line = it.line
+        if it.section_title:
+            line = f"{line}  _( {it.section_title} )_"
+        out.append(line)
+        if len(out) >= limit:
+            break
+    return out
 
 
 # =========================
@@ -399,7 +456,6 @@ async def plex_recent_library_autocomplete(interaction: discord.Interaction, cur
         sid = s.get("id", "")
         if not title:
             continue
-        # match on normalized text so "tvshows" matches "TV Shows"
         if not q or _norm(q) in _norm(title) or (sid and q.strip() in sid):
             label = f"{title} ({sid})" if sid else title
             choices.append(app_commands.Choice(name=label[:100], value=title[:100]))
