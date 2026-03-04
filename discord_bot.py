@@ -12,7 +12,7 @@ import aiohttp
 import discord
 from discord import app_commands
 
-__version__ = "0.2.5"
+__version__ = "0.2.6"
 
 # =========================
 # Env / Config
@@ -272,16 +272,10 @@ def _format_recent_item(el: ET.Element) -> Optional[RecentItem]:
 
 
 def _collapse_episodes_to_seasons(items: List[RecentItem], threshold: int) -> List[RecentItem]:
-    """
-    Within each library section:
-      - If a season item exists, suppress episodes from that same season (as before).
-      - Additionally, if MANY episodes from the same season appear and no season item exists,
-        collapse them into a synthetic "Show — Season X (N eps)" line.
-    """
     if not items:
         return items
 
-    # season keys explicitly present per section
+    # Explicit season keys present per section
     explicit_season_keys_by_section: Dict[str, set] = {}
     for it in items:
         if it.kind == "season" and it.season_key and it.section_id:
@@ -303,9 +297,8 @@ def _collapse_episodes_to_seasons(items: List[RecentItem], threshold: int) -> Li
                 suppressed_episode_ids.add(id(e))
             continue
 
-        # If no explicit season, but many eps -> synthesize season line and suppress eps
+        # If many eps and no explicit season, synthesize season line and suppress eps
         if len(eps) >= threshold:
-            # Use newest addedAt among the episodes
             newest = max(eps, key=lambda x: x.added_at)
             show = newest.show_title or "Unknown Show"
             season_index = newest.season_index
@@ -321,7 +314,7 @@ def _collapse_episodes_to_seasons(items: List[RecentItem], threshold: int) -> Li
                     section_title=newest.section_title,
                     section_id=section_id,
                     kind="season",
-                    season_key=parent_season_key,  # treat as season key for suppression
+                    season_key=parent_season_key,
                     show_title=show,
                     season_index=season_index,
                 )
@@ -329,7 +322,6 @@ def _collapse_episodes_to_seasons(items: List[RecentItem], threshold: int) -> Li
             for e in eps:
                 suppressed_episode_ids.add(id(e))
 
-    # Build final list: keep items except suppressed episodes, then add synthetic seasons, then sort by addedAt desc
     kept: List[RecentItem] = []
     for it in items:
         if it.kind == "episode" and id(it) in suppressed_episode_ids:
@@ -359,7 +351,6 @@ async def fetch_recently_added(limit: int = 10, library: Optional[str] = None) -
             for child in list(root):
                 it = _format_recent_item(child)
                 if it:
-                    # Fill missing section fields (per-section calls sometimes omit them)
                     if not it.section_id:
                         it = replace(it, section_id=sid)
                     if not it.section_title:
@@ -414,6 +405,9 @@ class PlexBot(discord.Client):
 bot = PlexBot()
 
 
+# =========================
+# Slash commands
+# =========================
 @bot.tree.command(name="plex_ping", description="Test PlexBot")
 async def plex_ping(interaction: discord.Interaction):
     await interaction.response.send_message("PlexBot Pong ✅", ephemeral=True)
@@ -422,6 +416,28 @@ async def plex_ping(interaction: discord.Interaction):
 @bot.tree.command(name="plex_status", description="Statut du bot Plex")
 async def plex_status(interaction: discord.Interaction):
     await interaction.response.send_message(f"PlexBot Online 🎬 (v{__version__})", ephemeral=True)
+
+
+@bot.tree.command(name="plex_version", description="Affiche la version de PlexBot")
+async def plex_version(interaction: discord.Interaction):
+    await interaction.response.send_message(f"📦 PlexBot version **v{__version__}**", ephemeral=True)
+
+
+@bot.tree.command(name="plex_help", description="Aide et commandes disponibles")
+async def plex_help(interaction: discord.Interaction):
+    lines = [
+        "🧭 **PlexBot — Help**",
+        "",
+        "**/plex_playing** — Affiche ce qui joue présentement sur Plex",
+        "**/plex_recent** *(library?, limit?)* — Derniers ajouts (regroupe en saison si ≥ seuil)",
+        "**/plex_status** — Statut du bot",
+        "**/plex_version** — Version du bot",
+        "**/plex_ping** — Test rapide",
+        "",
+        f"⚙️ Seuil de regroupement saisons: **{RECENT_SEASON_COLLAPSE_THRESHOLD} eps**",
+        "Astuce: `/plex_recent library:\"TV Shows\" limit:15`",
+    ]
+    await interaction.response.send_message("\n".join(lines), ephemeral=True)
 
 
 @bot.tree.command(name="plex_playing", description="Affiche ce qui joue présentement sur Plex")
@@ -481,6 +497,7 @@ async def plex_recent(interaction: discord.Interaction, library: Optional[str] =
     if library:
         title += f" _(filter: {library})_"
     title += f" _(collapse≥{RECENT_SEASON_COLLAPSE_THRESHOLD} eps)_"
+
     lines = [title]
     for it in items:
         lines.append(f"• {it}")
