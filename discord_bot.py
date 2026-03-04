@@ -12,7 +12,7 @@ import aiohttp
 import discord
 from discord import app_commands
 
-__version__ = "0.2.7"
+__version__ = "0.2.8"
 
 # =========================
 # Env / Config
@@ -72,7 +72,7 @@ def _norm(s: str) -> str:
 
 
 def _header(title: str) -> str:
-    """Standard header for every command output."""
+    """Standard header for most command outputs (requested: version at top)."""
     return f"{title}  _(v{__version__})_"
 
 
@@ -415,19 +415,24 @@ async def plex_version(interaction: discord.Interaction):
 
 @bot.tree.command(name="plex_help", description="Aide et commandes disponibles")
 async def plex_help(interaction: discord.Interaction):
-    lines = [
-        _header("🧭 PlexBot — Help"),
-        "",
-        "**/plex_playing** — Affiche ce qui joue présentement sur Plex",
-        "**/plex_recent** *(library?, limit?)* — Derniers ajouts (regroupe en saison si beaucoup d’épisodes)",
-        "**/plex_status** — Statut du bot",
-        "**/plex_version** — Version du bot",
-        "**/plex_ping** — Test rapide",
-        "",
-        f"⚙️ Regroupement saisons: **≥ {RECENT_SEASON_COLLAPSE_THRESHOLD} épisodes**",
-        "Ex: `/plex_recent library:\"TV Shows\" limit:15`",
-    ]
-    await interaction.response.send_message("\n".join(lines), ephemeral=True)
+    # Match your PZBot style: one embed, categories, version in footer (not in header)
+    desc = "\n".join(
+        [
+            "**Core**",
+            "• `/plex_status` — Bot status",
+            "• `/plex_playing` — Now playing sessions",
+            "• `/plex_recent` — Recently added (library filter + season collapse)",
+            "• `/plex_version` — Bot version",
+            "• `/plex_ping` — Bot ping",
+            "",
+            "**Tips**",
+            f"• Season collapse: ≥ **{RECENT_SEASON_COLLAPSE_THRESHOLD} eps**",
+            "• Example: `/plex_recent library:\"TV Shows\" limit:15`",
+        ]
+    )
+    embed = discord.Embed(title="🎬 Plex — Help", description=desc)
+    embed.set_footer(text=f"PlexBot v{__version__}")
+    await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
 @bot.tree.command(name="plex_playing", description="Affiche ce qui joue présentement sur Plex")
