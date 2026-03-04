@@ -5,14 +5,14 @@ import logging
 import os
 import re
 import xml.etree.ElementTree as ET
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Optional, List, Dict, Tuple
 
 import aiohttp
 import discord
 from discord import app_commands
 
-__version__ = "0.2.4"
+__version__ = "0.2.5"
 
 # =========================
 # Env / Config
@@ -22,6 +22,10 @@ GUILD_ID = (os.environ.get("PLEXBOT_GUILD_ID") or "").strip()
 
 PLEX_TOKEN = (os.environ.get("PLEXBOT_PLEX_TOKEN") or "").strip()
 PLEX_BASE_URL = (os.environ.get("PLEXBOT_PLEX_BASE_URL") or "http://127.0.0.1:32400").strip()
+
+# If >= this many episodes from the same season appear in the recent feed,
+# we collapse them into a single "Season X (N eps)" line.
+RECENT_SEASON_COLLAPSE_THRESHOLD = int(os.environ.get("PLEXBOT_RECENT_SEASON_COLLAPSE_THRESHOLD") or "5")
 
 if not DISCORD_TOKEN:
     raise RuntimeError("PLEXBOT_DISCORD_TOKEN manquant (variable d’environnement Windows).")
@@ -172,7 +176,7 @@ async def fetch_plex_sessions() -> list[dict]:
 
 
 # =========================
-# Plex: recently added (season-vs-episode logic)
+# Plex: recently added (smart collapsing)
 # =========================
 @dataclass(frozen=True)
 class RecentItem:
@@ -180,19 +184,16 @@ class RecentItem:
     line: str
     section_title: str
     section_id: str
-    kind: str  # "season" | "episode" | "movie" | other
-    season_key: str = ""  # ratingKey of the season (for season items)
-    episode_parent_season_key: str = ""  # parentRatingKey of the episode (to suppress if season is present)
+    kind: str  # "season" | "episode" | "movie" | "show"
+    # Identifiers for grouping/suppression
+    season_key: str = ""  # ratingKey of the season (for season items; when available)
+    episode_parent_season_key: str = ""  # parentRatingKey of the episode
+    # For building synthetic season lines
+    show_title: str = ""
+    season_index: str = ""  # parentIndex for episode, index for season
 
 
 def _format_recent_item(el: ET.Element) -> Optional[RecentItem]:
-    """
-    Handles:
-      - Video movie
-      - Video episode
-      - Directory season (TV libraries often show "Season 1" blocks)
-      - Directory show (fallback)
-    """
     added_at = int(el.get("addedAt") or "0")
     tag = el.tag.lower()
     media_type = _safe(el.get("type"))
@@ -210,12 +211,12 @@ def _format_recent_item(el: ET.Element) -> Optional[RecentItem]:
         if media_type == "episode":
             show = _safe(el.get("grandparentTitle"))
             title = _safe(el.get("title"))
-            season = el.get("parentIndex")
-            ep = el.get("index")
+            season = _safe(el.get("parentIndex"))
+            ep = _safe(el.get("index"))
 
             se = ""
             try:
-                if season and ep:
+                if season.isdigit() and ep.isdigit():
                     se = f"S{int(season):02d}E{int(ep):02d} "
             except ValueError:
                 pass
@@ -229,12 +230,13 @@ def _format_recent_item(el: ET.Element) -> Optional[RecentItem]:
                 section_id,
                 kind="episode",
                 episode_parent_season_key=parent_season_key,
+                show_title=show,
+                season_index=season,
             )
 
         return None
 
     if tag == "directory":
-        # TV libraries often return seasons as Directory entries
         if media_type == "season":
             show = _safe(el.get("parentTitle")) or _safe(el.get("grandparentTitle"))
             season_index = _safe(el.get("index"))
@@ -256,41 +258,87 @@ def _format_recent_item(el: ET.Element) -> Optional[RecentItem]:
                 section_id,
                 kind="season",
                 season_key=season_key,
+                show_title=show,
+                season_index=season_index,
             )
 
         if media_type == "show":
             title = _safe(el.get("title")) or _safe(el.get("name"))
             if not title:
                 return None
-            return RecentItem(added_at, f"📺 {title}", section_title, section_id, kind="show")
+            return RecentItem(added_at, f"📺 {title}", section_title, section_id, kind="show", show_title=title)
 
     return None
 
 
-def _apply_season_preference(items: List[RecentItem]) -> List[RecentItem]:
+def _collapse_episodes_to_seasons(items: List[RecentItem], threshold: int) -> List[RecentItem]:
     """
-    Rule (as requested):
-      - If a full season entry exists (Directory season), show the season entry.
-      - Hide individual episodes that belong to that season (parentRatingKey matches season ratingKey).
-      - If only episodes exist, show episodes.
-    This is applied per library section.
+    Within each library section:
+      - If a season item exists, suppress episodes from that same season (as before).
+      - Additionally, if MANY episodes from the same season appear and no season item exists,
+        collapse them into a synthetic "Show — Season X (N eps)" line.
     """
-    # Collect season keys per section
-    season_keys_by_section: Dict[str, set] = {}
-    for it in items:
-        if it.kind == "season" and it.season_key and it.section_id:
-            season_keys_by_section.setdefault(it.section_id, set()).add(it.season_key)
-
-    if not season_keys_by_section:
+    if not items:
         return items
 
-    filtered: List[RecentItem] = []
+    # season keys explicitly present per section
+    explicit_season_keys_by_section: Dict[str, set] = {}
     for it in items:
-        if it.kind == "episode" and it.section_id in season_keys_by_section:
-            if it.episode_parent_season_key and it.episode_parent_season_key in season_keys_by_section[it.section_id]:
-                continue  # season is present, suppress episodes from that season
-        filtered.append(it)
-    return filtered
+        if it.kind == "season" and it.season_key and it.section_id:
+            explicit_season_keys_by_section.setdefault(it.section_id, set()).add(it.season_key)
+
+    # Count episodes per (section_id, parent_season_key)
+    episode_groups: Dict[Tuple[str, str], List[RecentItem]] = {}
+    for it in items:
+        if it.kind == "episode" and it.section_id and it.episode_parent_season_key:
+            episode_groups.setdefault((it.section_id, it.episode_parent_season_key), []).append(it)
+
+    synthetic_seasons: List[RecentItem] = []
+    suppressed_episode_ids: set[int] = set()
+
+    for (section_id, parent_season_key), eps in episode_groups.items():
+        # If explicit season exists, suppress episodes (existing behavior)
+        if section_id in explicit_season_keys_by_section and parent_season_key in explicit_season_keys_by_section[section_id]:
+            for e in eps:
+                suppressed_episode_ids.add(id(e))
+            continue
+
+        # If no explicit season, but many eps -> synthesize season line and suppress eps
+        if len(eps) >= threshold:
+            # Use newest addedAt among the episodes
+            newest = max(eps, key=lambda x: x.added_at)
+            show = newest.show_title or "Unknown Show"
+            season_index = newest.season_index
+            if season_index.isdigit():
+                line = f"📺 {show} — Season {int(season_index)} ({len(eps)} eps)"
+            else:
+                line = f"📺 {show} — Season ({len(eps)} eps)"
+
+            synthetic_seasons.append(
+                RecentItem(
+                    added_at=newest.added_at,
+                    line=line,
+                    section_title=newest.section_title,
+                    section_id=section_id,
+                    kind="season",
+                    season_key=parent_season_key,  # treat as season key for suppression
+                    show_title=show,
+                    season_index=season_index,
+                )
+            )
+            for e in eps:
+                suppressed_episode_ids.add(id(e))
+
+    # Build final list: keep items except suppressed episodes, then add synthetic seasons, then sort by addedAt desc
+    kept: List[RecentItem] = []
+    for it in items:
+        if it.kind == "episode" and id(it) in suppressed_episode_ids:
+            continue
+        kept.append(it)
+
+    kept.extend(synthetic_seasons)
+    kept.sort(key=lambda x: x.added_at, reverse=True)
+    return kept
 
 
 async def fetch_recently_added(limit: int = 10, library: Optional[str] = None) -> list[str]:
@@ -307,28 +355,29 @@ async def fetch_recently_added(limit: int = 10, library: Optional[str] = None) -
             sid = s.get("id")
             if not sid:
                 continue
-            root = await _plex_get_xml(f"/library/sections/{sid}/recentlyAdded?X-Plex-Container-Size=200")
+            root = await _plex_get_xml(f"/library/sections/{sid}/recentlyAdded?X-Plex-Container-Size=250")
             for child in list(root):
                 it = _format_recent_item(child)
                 if it:
-                    # section id/title may be missing in per-section results; fill them from section info
+                    # Fill missing section fields (per-section calls sometimes omit them)
                     if not it.section_id:
-                        it = RecentItem(it.added_at, it.line, it.section_title or s["title"], sid, it.kind, it.season_key, it.episode_parent_season_key)
+                        it = replace(it, section_id=sid)
+                    if not it.section_title:
+                        it = replace(it, section_title=s["title"])
                     merged.append(it)
 
         merged.sort(key=lambda x: x.added_at, reverse=True)
-        merged = _apply_season_preference(merged)
+        merged = _collapse_episodes_to_seasons(merged, threshold=RECENT_SEASON_COLLAPSE_THRESHOLD)
         return [it.line for it in merged[:limit]]
 
-    # No filter: global recentlyAdded (already sorted by addedAt descending)
-    root = await _plex_get_xml("/library/recentlyAdded?X-Plex-Container-Size=250")
+    root = await _plex_get_xml("/library/recentlyAdded?X-Plex-Container-Size=300")
     parsed: List[RecentItem] = []
     for child in list(root):
         it = _format_recent_item(child)
         if it:
             parsed.append(it)
 
-    parsed = _apply_season_preference(parsed)
+    parsed = _collapse_episodes_to_seasons(parsed, threshold=RECENT_SEASON_COLLAPSE_THRESHOLD)
 
     out: List[str] = []
     for it in parsed:
@@ -431,6 +480,7 @@ async def plex_recent(interaction: discord.Interaction, library: Optional[str] =
     title = "🆕 **Plex — Recently Added**"
     if library:
         title += f" _(filter: {library})_"
+    title += f" _(collapse≥{RECENT_SEASON_COLLAPSE_THRESHOLD} eps)_"
     lines = [title]
     for it in items:
         lines.append(f"• {it}")
