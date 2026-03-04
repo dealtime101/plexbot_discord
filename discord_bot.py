@@ -12,7 +12,7 @@ import aiohttp
 import discord
 from discord import app_commands
 
-__version__ = "0.2.6"
+__version__ = "0.2.7"
 
 # =========================
 # Env / Config
@@ -71,6 +71,11 @@ def _norm(s: str) -> str:
     return re.sub(r"[^a-z0-9]+", "", (s or "").lower())
 
 
+def _header(title: str) -> str:
+    """Standard header for every command output."""
+    return f"{title}  _(v{__version__})_"
+
+
 # =========================
 # Plex HTTP
 # =========================
@@ -103,7 +108,7 @@ async def fetch_library_sections() -> List[Dict[str, str]]:
             {
                 "id": _safe(d.get("key")),
                 "title": _safe(d.get("title")),
-                "type": _safe(d.get("type")),  # movie / show / artist / photo...
+                "type": _safe(d.get("type")),
             }
         )
     return out
@@ -184,13 +189,11 @@ class RecentItem:
     line: str
     section_title: str
     section_id: str
-    kind: str  # "season" | "episode" | "movie" | "show"
-    # Identifiers for grouping/suppression
-    season_key: str = ""  # ratingKey of the season (for season items; when available)
-    episode_parent_season_key: str = ""  # parentRatingKey of the episode
-    # For building synthetic season lines
+    kind: str  # "season" | "episode" | "movie"
+    season_key: str = ""
+    episode_parent_season_key: str = ""
     show_title: str = ""
-    season_index: str = ""  # parentIndex for episode, index for season
+    season_index: str = ""
 
 
 def _format_recent_item(el: ET.Element) -> Optional[RecentItem]:
@@ -221,7 +224,7 @@ def _format_recent_item(el: ET.Element) -> Optional[RecentItem]:
             except ValueError:
                 pass
 
-            parent_season_key = _safe(el.get("parentRatingKey"))  # season ratingKey
+            parent_season_key = _safe(el.get("parentRatingKey"))
             line = f"📺 {show} — {se}{title}".strip()
             return RecentItem(
                 added_at,
@@ -233,40 +236,31 @@ def _format_recent_item(el: ET.Element) -> Optional[RecentItem]:
                 show_title=show,
                 season_index=season,
             )
-
         return None
 
-    if tag == "directory":
-        if media_type == "season":
-            show = _safe(el.get("parentTitle")) or _safe(el.get("grandparentTitle"))
-            season_index = _safe(el.get("index"))
-            season_key = _safe(el.get("ratingKey")) or _safe(el.get("key"))
+    if tag == "directory" and media_type == "season":
+        show = _safe(el.get("parentTitle")) or _safe(el.get("grandparentTitle"))
+        season_index = _safe(el.get("index"))
+        season_key = _safe(el.get("ratingKey")) or _safe(el.get("key"))
+        if not show:
+            return None
 
-            if not show:
-                return None
+        if season_index.isdigit():
+            line = f"📺 {show} — Season {int(season_index)}"
+        else:
+            season_title = _safe(el.get("title")) or "Season"
+            line = f"📺 {show} — {season_title}"
 
-            if season_index.isdigit():
-                line = f"📺 {show} — Season {int(season_index)}"
-            else:
-                season_title = _safe(el.get("title")) or "Season"
-                line = f"📺 {show} — {season_title}"
-
-            return RecentItem(
-                added_at,
-                line,
-                section_title,
-                section_id,
-                kind="season",
-                season_key=season_key,
-                show_title=show,
-                season_index=season_index,
-            )
-
-        if media_type == "show":
-            title = _safe(el.get("title")) or _safe(el.get("name"))
-            if not title:
-                return None
-            return RecentItem(added_at, f"📺 {title}", section_title, section_id, kind="show", show_title=title)
+        return RecentItem(
+            added_at,
+            line,
+            section_title,
+            section_id,
+            kind="season",
+            season_key=season_key,
+            show_title=show,
+            season_index=season_index,
+        )
 
     return None
 
@@ -275,13 +269,11 @@ def _collapse_episodes_to_seasons(items: List[RecentItem], threshold: int) -> Li
     if not items:
         return items
 
-    # Explicit season keys present per section
     explicit_season_keys_by_section: Dict[str, set] = {}
     for it in items:
         if it.kind == "season" and it.season_key and it.section_id:
             explicit_season_keys_by_section.setdefault(it.section_id, set()).add(it.season_key)
 
-    # Count episodes per (section_id, parent_season_key)
     episode_groups: Dict[Tuple[str, str], List[RecentItem]] = {}
     for it in items:
         if it.kind == "episode" and it.section_id and it.episode_parent_season_key:
@@ -291,13 +283,11 @@ def _collapse_episodes_to_seasons(items: List[RecentItem], threshold: int) -> Li
     suppressed_episode_ids: set[int] = set()
 
     for (section_id, parent_season_key), eps in episode_groups.items():
-        # If explicit season exists, suppress episodes (existing behavior)
         if section_id in explicit_season_keys_by_section and parent_season_key in explicit_season_keys_by_section[section_id]:
             for e in eps:
                 suppressed_episode_ids.add(id(e))
             continue
 
-        # If many eps and no explicit season, synthesize season line and suppress eps
         if len(eps) >= threshold:
             newest = max(eps, key=lambda x: x.added_at)
             show = newest.show_title or "Unknown Show"
@@ -410,32 +400,32 @@ bot = PlexBot()
 # =========================
 @bot.tree.command(name="plex_ping", description="Test PlexBot")
 async def plex_ping(interaction: discord.Interaction):
-    await interaction.response.send_message("PlexBot Pong ✅", ephemeral=True)
+    await interaction.response.send_message(_header("🏓 PlexBot Pong ✅"), ephemeral=True)
 
 
 @bot.tree.command(name="plex_status", description="Statut du bot Plex")
 async def plex_status(interaction: discord.Interaction):
-    await interaction.response.send_message(f"PlexBot Online 🎬 (v{__version__})", ephemeral=True)
+    await interaction.response.send_message(_header("🎬 PlexBot Online"), ephemeral=True)
 
 
 @bot.tree.command(name="plex_version", description="Affiche la version de PlexBot")
 async def plex_version(interaction: discord.Interaction):
-    await interaction.response.send_message(f"📦 PlexBot version **v{__version__}**", ephemeral=True)
+    await interaction.response.send_message(_header("📦 PlexBot Version"), ephemeral=True)
 
 
 @bot.tree.command(name="plex_help", description="Aide et commandes disponibles")
 async def plex_help(interaction: discord.Interaction):
     lines = [
-        "🧭 **PlexBot — Help**",
+        _header("🧭 PlexBot — Help"),
         "",
         "**/plex_playing** — Affiche ce qui joue présentement sur Plex",
-        "**/plex_recent** *(library?, limit?)* — Derniers ajouts (regroupe en saison si ≥ seuil)",
+        "**/plex_recent** *(library?, limit?)* — Derniers ajouts (regroupe en saison si beaucoup d’épisodes)",
         "**/plex_status** — Statut du bot",
         "**/plex_version** — Version du bot",
         "**/plex_ping** — Test rapide",
         "",
-        f"⚙️ Seuil de regroupement saisons: **{RECENT_SEASON_COLLAPSE_THRESHOLD} eps**",
-        "Astuce: `/plex_recent library:\"TV Shows\" limit:15`",
+        f"⚙️ Regroupement saisons: **≥ {RECENT_SEASON_COLLAPSE_THRESHOLD} épisodes**",
+        "Ex: `/plex_recent library:\"TV Shows\" limit:15`",
     ]
     await interaction.response.send_message("\n".join(lines), ephemeral=True)
 
@@ -447,15 +437,15 @@ async def plex_playing(interaction: discord.Interaction):
     try:
         sessions = await fetch_plex_sessions()
     except Exception as e:
-        await interaction.followup.send(f"Erreur Plex: {e}", ephemeral=True)
+        await interaction.followup.send(f"{_header('❌ Plex — Error')}\n\nErreur Plex: {e}", ephemeral=True)
         return
 
     if not sessions:
-        await interaction.followup.send("Aucune lecture en cours sur Plex.", ephemeral=True)
+        await interaction.followup.send(f"{_header('🎬 Plex — Now Playing')}\n\nAucune lecture en cours sur Plex.", ephemeral=True)
         return
 
     sessions = sessions[:10]
-    lines = ["🎬 **Plex — Now Playing**"]
+    lines = [_header("🎬 Plex — Now Playing")]
 
     for s in sessions:
         lines.append(
@@ -486,17 +476,17 @@ async def plex_recent(interaction: discord.Interaction, library: Optional[str] =
     try:
         items = await fetch_recently_added(limit=n, library=library)
     except Exception as e:
-        await interaction.followup.send(f"Erreur Plex: {e}", ephemeral=True)
+        await interaction.followup.send(f"{_header('❌ Plex — Error')}\n\nErreur Plex: {e}", ephemeral=True)
         return
 
-    if not items:
-        await interaction.followup.send("Aucun élément récent trouvé.", ephemeral=True)
-        return
-
-    title = "🆕 **Plex — Recently Added**"
+    title = _header("🆕 Plex — Recently Added")
     if library:
         title += f" _(filter: {library})_"
     title += f" _(collapse≥{RECENT_SEASON_COLLAPSE_THRESHOLD} eps)_"
+
+    if not items:
+        await interaction.followup.send(f"{title}\n\nAucun élément récent trouvé.", ephemeral=True)
+        return
 
     lines = [title]
     for it in items:
