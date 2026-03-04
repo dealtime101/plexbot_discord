@@ -10,14 +10,8 @@ import aiohttp
 import discord
 from discord import app_commands
 
-# =========================
-# Version
-# =========================
-__version__ = "0.2.0"
+__version__ = "0.2.1"
 
-# =========================
-# Env / Config
-# =========================
 DISCORD_TOKEN = (os.environ.get("PLEXBOT_DISCORD_TOKEN") or "").strip()
 GUILD_ID = (os.environ.get("PLEXBOT_GUILD_ID") or "").strip()
 
@@ -25,11 +19,8 @@ PLEX_TOKEN = (os.environ.get("PLEXBOT_PLEX_TOKEN") or "").strip()
 PLEX_BASE_URL = (os.environ.get("PLEXBOT_PLEX_BASE_URL") or "http://127.0.0.1:32400").strip()
 
 if not DISCORD_TOKEN:
-    raise RuntimeError("PLEXBOT_DISCORD_TOKEN manquant (variable d’environnement Windows).")
+    raise RuntimeError("PLEXBOT_DISCORD_TOKEN manquant")
 
-# =========================
-# Logging
-# =========================
 logging.basicConfig(
     level=logging.INFO,
     format="[%(asctime)s] %(levelname)s %(name)s: %(message)s",
@@ -37,9 +28,6 @@ logging.basicConfig(
 log = logging.getLogger("PlexBot")
 
 
-# =========================
-# Plex helpers
-# =========================
 def _fmt_ms(ms: int) -> str:
     if ms <= 0:
         return "0:00"
@@ -60,34 +48,18 @@ def _pretty_state(state: str) -> str:
         "playing": "▶️ Playing",
         "paused": "⏸️ Paused",
         "buffering": "⏳ Buffering",
-    }.get(s, f"• {state}" if state else "• Unknown")
-
-
-def _emoji_for_type(media_type: str) -> str:
-    t = (media_type or "").lower().strip()
-    if t == "movie":
-        return "🎬"
-    if t == "episode":
-        return "📺"
-    if t in ("track", "music"):
-        return "🎵"
-    return "📦"
+    }.get(s, state)
 
 
 async def _plex_get_xml(path: str) -> ET.Element:
-    if not PLEX_TOKEN:
-        raise RuntimeError("PLEXBOT_PLEX_TOKEN manquant (variable d’environnement Windows).")
-
     url = f"{PLEX_BASE_URL}{path}"
     sep = "&" if "?" in url else "?"
     url = f"{url}{sep}X-Plex-Token={PLEX_TOKEN}"
 
-    timeout = aiohttp.ClientTimeout(total=10)
-    async with aiohttp.ClientSession(timeout=timeout) as session:
+    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10)) as session:
         async with session.get(url) as resp:
             if resp.status != 200:
-                body = await resp.text()
-                raise RuntimeError(f"Plex HTTP {resp.status}: {body[:200]}")
+                raise RuntimeError(f"Plex HTTP {resp.status}")
             xml_text = await resp.text()
 
     return ET.fromstring(xml_text)
@@ -95,8 +67,8 @@ async def _plex_get_xml(path: str) -> ET.Element:
 
 async def fetch_plex_sessions() -> list[dict]:
     root = await _plex_get_xml("/status/sessions")
-
     sessions: list[dict] = []
+
     for v in root.findall("./Video"):
         media_type = _safe(v.get("type"))
         title = _safe(v.get("title"))
@@ -125,8 +97,8 @@ async def fetch_plex_sessions() -> list[dict]:
                 if season and ep:
                     se = f"S{int(season):02d}E{int(ep):02d} "
             except ValueError:
-                se = ""
-            display_title = f"{show} — {se}{title}".strip()
+                pass
+            display_title = f"{show} — {se}{title}"
         else:
             display_title = title
 
@@ -134,7 +106,7 @@ async def fetch_plex_sessions() -> list[dict]:
             {
                 "user": user or "Unknown",
                 "state": state or "unknown",
-                "title": display_title or "Unknown title",
+                "title": display_title,
                 "progress": f"{_fmt_ms(view_offset)} / {_fmt_ms(duration)}",
                 "quality": " ".join(
                     x for x in [resolution, (vcodec.upper() if vcodec else ""), container] if x
@@ -146,21 +118,19 @@ async def fetch_plex_sessions() -> list[dict]:
 
 
 async def fetch_recently_added(limit: int = 10) -> list[str]:
-    # Plex supports X-Plex-Container-Start/Size for pagination, but a simple limit works for most.
-    # We'll request a bit more and then trim, in case Plex returns mixed items.
-    size = max(10, min(50, limit))
-    root = await _plex_get_xml(f"/library/recentlyAdded?X-Plex-Container-Start=0&X-Plex-Container-Size={size}")
+    root = await _plex_get_xml("/library/recentlyAdded?X-Plex-Container-Size=50")
 
     items: list[str] = []
-    for el in root:
-        # Items can be <Video> (movie/episode) or <Directory> (season/show) in some setups.
-        tag = el.tag.lower()
-        if tag not in ("video", "directory"):
-            continue
 
+    for el in root.findall("./Video"):
         media_type = _safe(el.get("type"))
 
-        if media_type == "episode":
+        if media_type == "movie":
+            title = _safe(el.get("title"))
+            year = _safe(el.get("year"))
+            line = f"🎬 {title} ({year})" if year else f"🎬 {title}"
+
+        elif media_type == "episode":
             show = _safe(el.get("grandparentTitle"))
             title = _safe(el.get("title"))
             season = el.get("parentIndex")
@@ -171,30 +141,21 @@ async def fetch_recently_added(limit: int = 10) -> list[str]:
                 if season and ep:
                     se = f"S{int(season):02d}E{int(ep):02d} "
             except ValueError:
-                se = ""
-            line = f"{_emoji_for_type(media_type)} {show} — {se}{title}".strip()
+                pass
 
-        elif media_type == "movie":
-            title = _safe(el.get("title"))
-            year = _safe(el.get("year"))
-            line = f"{_emoji_for_type(media_type)} {title}{f' ({year})' if year else ''}".strip()
+            line = f"📺 {show} — {se}{title}"
 
         else:
-            # Fallback for other types
-            title = _safe(el.get("title")) or _safe(el.get("name"))
-            line = f"{_emoji_for_type(media_type)} {title}".strip()
+            continue
 
-        if line:
-            items.append(line)
+        items.append(line)
+
         if len(items) >= limit:
             break
 
     return items
 
 
-# =========================
-# Discord bot
-# =========================
 class PlexBot(discord.Client):
     def __init__(self) -> None:
         intents = discord.Intents.default()
@@ -205,21 +166,17 @@ class PlexBot(discord.Client):
         if GUILD_ID:
             guild = discord.Object(id=int(GUILD_ID))
             self.tree.copy_global_to(guild=guild)
-            synced = await self.tree.sync(guild=guild)
-            log.info("Slash commands sync (guild): %s", len(synced))
+            await self.tree.sync(guild=guild)
         else:
-            synced = await self.tree.sync()
-            log.info("Slash commands sync (global): %s", len(synced))
+            await self.tree.sync()
 
     async def on_ready(self) -> None:
-        log.info("Connecté en tant que %s (id=%s)", self.user, self.user.id)
+        log.info("Connecté en tant que %s", self.user)
 
 
 bot = PlexBot()
 
-# =========================
-# Slash commands
-# =========================
+
 @bot.tree.command(name="plex_ping", description="Test PlexBot")
 async def plex_ping(interaction: discord.Interaction):
     await interaction.response.send_message("PlexBot Pong ✅", ephemeral=True)
@@ -244,7 +201,6 @@ async def plex_playing(interaction: discord.Interaction):
         await interaction.followup.send("Aucune lecture en cours sur Plex.", ephemeral=True)
         return
 
-    sessions = sessions[:10]
     lines = ["🎬 **Plex — Now Playing**"]
 
     for s in sessions:
@@ -255,26 +211,15 @@ async def plex_playing(interaction: discord.Interaction):
             f"📺 {s['quality'] or 'n/a'}"
         )
 
-    msg = "\n".join(lines)
-    if len(msg) > 1900:
-        msg = msg[:1900] + "\n…(tronqué)"
-
-    await interaction.followup.send(msg, ephemeral=True)
+    await interaction.followup.send("\n".join(lines), ephemeral=True)
 
 
-@bot.tree.command(name="plex_recent", description="Affiche les derniers ajouts sur Plex")
-@app_commands.describe(limit="Nombre d’items à afficher (1-15)")
-async def plex_recent(interaction: discord.Interaction, limit: Optional[int] = 10):
+@bot.tree.command(name="plex_recent", description="Affiche les derniers ajouts Plex")
+async def plex_recent(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
 
     try:
-        n = int(limit) if limit is not None else 10
-    except (TypeError, ValueError):
-        n = 10
-    n = max(1, min(15, n))
-
-    try:
-        items = await fetch_recently_added(limit=n)
+        items = await fetch_recently_added(limit=10)
     except Exception as e:
         await interaction.followup.send(f"Erreur Plex: {e}", ephemeral=True)
         return
@@ -287,15 +232,8 @@ async def plex_recent(interaction: discord.Interaction, limit: Optional[int] = 1
     for it in items:
         lines.append(f"• {it}")
 
-    msg = "\n".join(lines)
-    if len(msg) > 1900:
-        msg = msg[:1900] + "\n…(tronqué)"
-
-    await interaction.followup.send(msg, ephemeral=True)
+    await interaction.followup.send("\n".join(lines), ephemeral=True)
 
 
-# =========================
-# Entry
-# =========================
 if __name__ == "__main__":
     bot.run(DISCORD_TOKEN)
