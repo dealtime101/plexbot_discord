@@ -1,3 +1,4 @@
+
 from __future__ import annotations
 
 import logging
@@ -7,6 +8,11 @@ import xml.etree.ElementTree as ET
 import aiohttp
 import discord
 from discord import app_commands
+
+# =========================
+# Version
+# =========================
+__version__ = "0.1.1"
 
 # =========================
 # Env / Config
@@ -29,12 +35,10 @@ logging.basicConfig(
 )
 log = logging.getLogger("PlexBot")
 
-
 # =========================
 # Plex helpers
 # =========================
 def _fmt_ms(ms: int) -> str:
-    """Format milliseconds as m:ss or h:mm:ss."""
     if ms <= 0:
         return "0:00"
     s = ms // 1000
@@ -48,8 +52,16 @@ def _safe(text: str | None) -> str:
     return (text or "").strip()
 
 
+def _pretty_state(state: str) -> str:
+    s = (state or "").lower().strip()
+    return {
+        "playing": "▶️ Playing",
+        "paused": "⏸️ Paused",
+        "buffering": "⏳ Buffering",
+    }.get(s, f"• {state}" if state else "• Unknown")
+
+
 async def fetch_plex_sessions() -> list[dict]:
-    """Fetch current Plex sessions from /status/sessions and return normalized dicts."""
     if not PLEX_TOKEN:
         raise RuntimeError("PLEXBOT_PLEX_TOKEN manquant (variable d’environnement Windows).")
 
@@ -67,48 +79,27 @@ async def fetch_plex_sessions() -> list[dict]:
     sessions: list[dict] = []
 
     for v in root.findall("./Video"):
-        media_type = _safe(v.get("type"))  # movie / episode
+        media_type = _safe(v.get("type"))
         title = _safe(v.get("title"))
 
-        # For episodes
         show = _safe(v.get("grandparentTitle"))
         season = v.get("parentIndex")
         ep = v.get("index")
 
-        # User
         user_el = v.find("./User")
         user = _safe(user_el.get("title") if user_el is not None else "")
 
-        # Player
         player_el = v.find("./Player")
-        device = _safe(player_el.get("device") if player_el is not None else "")
-        player_title = _safe(player_el.get("title") if player_el is not None else "")
-        state = _safe(player_el.get("state") if player_el is not None else "")  # playing/paused/buffering
+        state = _safe(player_el.get("state") if player_el is not None else "")
 
-        # Progress
         duration = int(v.get("duration") or "0")
         view_offset = int(v.get("viewOffset") or "0")
 
-        # Direct play / transcode (best effort)
-        decision = ""
-        part_el = v.find(".//Part")
-        if part_el is not None and part_el.get("decision"):
-            decision = _safe(part_el.get("decision"))  # directplay / transcode / copy
-
-        trans_el = v.find("./TranscodeSession")
-        if trans_el is not None:
-            vdec = _safe(trans_el.get("videoDecision"))
-            adec = _safe(trans_el.get("audioDecision"))
-            if vdec or adec:
-                decision = f"video:{vdec or 'n/a'} audio:{adec or 'n/a'}"
-
-        # Quality
         media_el = v.find("./Media")
         resolution = _safe(media_el.get("videoResolution") if media_el is not None else "")
         container = _safe(media_el.get("container") if media_el is not None else "")
         vcodec = _safe(media_el.get("videoCodec") if media_el is not None else "")
 
-        # Display title
         if media_type == "episode" and show:
             se = ""
             try:
@@ -125,9 +116,7 @@ async def fetch_plex_sessions() -> list[dict]:
                 "user": user or "Unknown",
                 "state": state or "unknown",
                 "title": display_title or "Unknown title",
-                "device": device or player_title or "Unknown device",
                 "progress": f"{_fmt_ms(view_offset)} / {_fmt_ms(duration)}",
-                "decision": decision or "unknown",
                 "quality": " ".join(
                     x for x in [resolution, (vcodec.upper() if vcodec else ""), container] if x
                 ).strip(),
@@ -147,7 +136,6 @@ class PlexBot(discord.Client):
         self.tree = app_commands.CommandTree(self)
 
     async def setup_hook(self) -> None:
-        # Sync slash commands: guild sync is instant, global can take a while.
         if GUILD_ID:
             guild = discord.Object(id=int(GUILD_ID))
             self.tree.copy_global_to(guild=guild)
@@ -163,7 +151,6 @@ class PlexBot(discord.Client):
 
 bot = PlexBot()
 
-
 # =========================
 # Slash commands
 # =========================
@@ -174,11 +161,12 @@ async def plex_ping(interaction: discord.Interaction):
 
 @bot.tree.command(name="plex_status", description="Statut du bot Plex")
 async def plex_status(interaction: discord.Interaction):
-    await interaction.response.send_message("PlexBot Online 🎬", ephemeral=True)
+    await interaction.response.send_message(f"PlexBot Online 🎬 (v{__version__})", ephemeral=True)
 
 
 @bot.tree.command(name="plex_playing", description="Affiche ce qui joue présentement sur Plex")
 async def plex_playing(interaction: discord.Interaction):
+
     await interaction.response.defer(ephemeral=True)
 
     try:
@@ -191,18 +179,20 @@ async def plex_playing(interaction: discord.Interaction):
         await interaction.followup.send("Aucune lecture en cours sur Plex.", ephemeral=True)
         return
 
-    sessions = sessions[:10]  # safety cap
+    sessions = sessions[:10]
+
     lines = ["🎬 **Plex — Now Playing**"]
 
     for s in sessions:
         lines.append(
-            f"\n**{s['user']}** ({s['state']})\n"
-            f"• {s['title']}\n"
-            f"• Progress: {s['progress']}\n"
-            f"• Quality: {s['quality'] or 'n/a'}"
+            f"\n**{s['user']}** — {_pretty_state(s['state'])}\n"
+            f"🎞️ {s['title']}\n"
+            f"⏱️ {s['progress']}\n"
+            f"📺 {s['quality'] or 'n/a'}"
         )
 
     msg = "\n".join(lines)
+
     if len(msg) > 1900:
         msg = msg[:1900] + "\n…(tronqué)"
 
