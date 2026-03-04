@@ -3,14 +3,15 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import xml.etree.ElementTree as ET
-from typing import Optional, List, Dict
+from typing import Optional, List, Dict, Tuple
 
 import aiohttp
 import discord
 from discord import app_commands
 
-__version__ = "0.2.2"
+__version__ = "0.2.3"
 
 # =========================
 # Env / Config
@@ -22,8 +23,11 @@ PLEX_TOKEN = (os.environ.get("PLEXBOT_PLEX_TOKEN") or "").strip()
 PLEX_BASE_URL = (os.environ.get("PLEXBOT_PLEX_BASE_URL") or "http://127.0.0.1:32400").strip()
 
 if not DISCORD_TOKEN:
-    raise RuntimeError("PLEXBOT_DISCORD_TOKEN manquant")
+    raise RuntimeError("PLEXBOT_DISCORD_TOKEN manquant (variable d’environnement Windows).")
 
+# =========================
+# Logging
+# =========================
 logging.basicConfig(
     level=logging.INFO,
     format="[%(asctime)s] %(levelname)s %(name)s: %(message)s",
@@ -32,7 +36,7 @@ log = logging.getLogger("PlexBot")
 
 
 # =========================
-# Small helpers
+# Helpers
 # =========================
 def _safe(text: str | None) -> str:
     return (text or "").strip()
@@ -57,8 +61,13 @@ def _pretty_state(state: str) -> str:
     }.get(s, state or "Unknown")
 
 
+def _norm(s: str) -> str:
+    """Normalize for fuzzy matching: lowercase and remove non-alnum (so 'TV Shows' == 'tvshows')."""
+    return re.sub(r"[^a-z0-9]+", "", (s or "").lower())
+
+
 # =========================
-# Plex HTTP helpers
+# Plex HTTP
 # =========================
 async def _plex_get_xml(path: str) -> ET.Element:
     if not PLEX_TOKEN:
@@ -79,13 +88,9 @@ async def _plex_get_xml(path: str) -> ET.Element:
 
 
 # =========================
-# Plex data fetchers
+# Plex: sections / now playing
 # =========================
 async def fetch_library_sections() -> List[Dict[str, str]]:
-    """
-    Returns a list of Plex library sections like:
-      [{"id":"2","title":"TV Shows","type":"show"}, ...]
-    """
     root = await _plex_get_xml("/library/sections")
     out: List[Dict[str, str]] = []
     for d in root.findall("./Directory"):
@@ -93,10 +98,24 @@ async def fetch_library_sections() -> List[Dict[str, str]]:
             {
                 "id": _safe(d.get("key")),
                 "title": _safe(d.get("title")),
-                "type": _safe(d.get("type")),  # movie / show / artist / photo etc.
+                "type": _safe(d.get("type")),  # movie / show / artist / photo...
             }
         )
     return out
+
+
+def _match_section(query: str, section: Dict[str, str]) -> bool:
+    q = _norm(query or "")
+    if not q:
+        return True
+
+    sid = _safe(section.get("id"))
+    title = section.get("title", "")
+
+    if q.isdigit() and sid == q:
+        return True
+
+    return q in _norm(title)  # space-insensitive match
 
 
 async def fetch_plex_sessions() -> list[dict]:
@@ -151,53 +170,30 @@ async def fetch_plex_sessions() -> list[dict]:
     return sessions
 
 
-def _match_section(query: str, section: Dict[str, str]) -> bool:
-    q = (query or "").strip().lower()
-    if not q:
-        return True
-    # allow ID match
-    if q.isdigit() and section.get("id") == q:
-        return True
-    # title contains match
-    return q in (section.get("title", "").lower())
-
-
-async def fetch_recently_added(limit: int = 10, library: Optional[str] = None) -> list[str]:
+# =========================
+# Plex: recently added (improved for TV Shows)
+# =========================
+def _format_recent_item(el: ET.Element) -> Optional[Tuple[int, str]]:
     """
-    Fetch recently added items.
-    If library is provided, filter by Plex library section title (case-insensitive substring) OR by section id.
+    Returns (addedAt, line) or None.
+    Handles:
+      - Video movie
+      - Video episode
+      - Directory season (TV libraries often show "Season 1" blocks)
+      - Directory show (rare but possible)
     """
-    sections = await fetch_library_sections()
-    matched_sections = [s for s in sections if _match_section(library or "", s)] if library else sections
+    added_at = int(el.get("addedAt") or "0")
+    tag = el.tag.lower()
+    media_type = _safe(el.get("type"))
 
-    if library and not matched_sections:
-        raise RuntimeError(
-            f"Aucune bibliothèque trouvée pour '{library}'. "
-            f"Exemples: {', '.join(s['title'] for s in sections[:8])}"
-        )
-
-    allowed_ids = {s["id"] for s in matched_sections if s.get("id")}
-    # Pull a larger page then filter down
-    root = await _plex_get_xml("/library/recentlyAdded?X-Plex-Container-Size=150")
-
-    items: list[str] = []
-
-    for el in root.findall("./Video"):
-        section_id = _safe(el.get("librarySectionID"))
-        section_title = _safe(el.get("librarySectionTitle"))
-
-        if allowed_ids and section_id and section_id not in allowed_ids:
-            continue
-
-        media_type = _safe(el.get("type"))
-
+    if tag == "video":
         if media_type == "movie":
             title = _safe(el.get("title"))
             year = _safe(el.get("year"))
-            prefix = "🎬"
-            line = f"{prefix} {title} ({year})" if year else f"{prefix} {title}"
+            line = f"🎬 {title} ({year})" if year else f"🎬 {title}"
+            return (added_at, line)
 
-        elif media_type == "episode":
+        if media_type == "episode":
             show = _safe(el.get("grandparentTitle"))
             title = _safe(el.get("title"))
             season = el.get("parentIndex")
@@ -210,18 +206,78 @@ async def fetch_recently_added(limit: int = 10, library: Optional[str] = None) -
             except ValueError:
                 pass
 
-            prefix = "📺"
-            line = f"{prefix} {show} — {se}{title}"
+            line = f"📺 {show} — {se}{title}".strip()
+            return (added_at, line)
 
-        else:
+        return None
+
+    if tag == "directory":
+        # TV libraries often return seasons as Directory entries
+        if media_type == "season":
+            show = _safe(el.get("parentTitle")) or _safe(el.get("grandparentTitle"))
+            season_index = _safe(el.get("index"))
+            if not show:
+                return None
+            if season_index.isdigit():
+                line = f"📺 {show} — Season {int(season_index)}"
+            else:
+                # fallback to title if index missing
+                season_title = _safe(el.get("title")) or "Season"
+                line = f"📺 {show} — {season_title}"
+            return (added_at, line)
+
+        if media_type == "show":
+            title = _safe(el.get("title")) or _safe(el.get("name"))
+            if not title:
+                return None
+            return (added_at, f"📺 {title}")
+
+    return None
+
+
+async def fetch_recently_added(limit: int = 10, library: Optional[str] = None) -> list[str]:
+    """
+    If library is provided:
+      - match library section(s) by name (space-insensitive) or id
+      - fetch /library/sections/<id>/recentlyAdded for better per-library results
+    Else:
+      - fetch global /library/recentlyAdded and label items with library name.
+    """
+    sections = await fetch_library_sections()
+
+    if library:
+        matched = [s for s in sections if _match_section(library, s)]
+        if not matched:
+            examples = ", ".join(s["title"] for s in sections[:10] if s.get("title"))
+            raise RuntimeError(f"Aucune bibliothèque trouvée pour '{library}'. Ex: {examples}")
+
+        # Pull per-section recentlyAdded, merge by addedAt
+        merged: List[Tuple[int, str]] = []
+        for s in matched:
+            sid = s.get("id")
+            if not sid:
+                continue
+            root = await _plex_get_xml(f"/library/sections/{sid}/recentlyAdded?X-Plex-Container-Size=150")
+            for child in list(root):
+                item = _format_recent_item(child)
+                if item:
+                    merged.append(item)
+
+        merged.sort(key=lambda x: x[0], reverse=True)
+        return [line for _, line in merged[:limit]]
+
+    # No filter: global recentlyAdded + include library label
+    root = await _plex_get_xml("/library/recentlyAdded?X-Plex-Container-Size=200")
+    items: List[str] = []
+    for child in list(root):
+        item = _format_recent_item(child)
+        if not item:
             continue
-
-        # Include library label if user didn't filter (helps when you have many libraries)
-        if not library and section_title:
+        _, line = item
+        section_title = _safe(child.get("librarySectionTitle"))
+        if section_title:
             line = f"{line}  _( {section_title} )_"
-
         items.append(line)
-
         if len(items) >= limit:
             break
 
@@ -252,7 +308,48 @@ class PlexBot(discord.Client):
 bot = PlexBot()
 
 
-# Autocomplete for library names in /plex_recent
+@bot.tree.command(name="plex_ping", description="Test PlexBot")
+async def plex_ping(interaction: discord.Interaction):
+    await interaction.response.send_message("PlexBot Pong ✅", ephemeral=True)
+
+
+@bot.tree.command(name="plex_status", description="Statut du bot Plex")
+async def plex_status(interaction: discord.Interaction):
+    await interaction.response.send_message(f"PlexBot Online 🎬 (v{__version__})", ephemeral=True)
+
+
+@bot.tree.command(name="plex_playing", description="Affiche ce qui joue présentement sur Plex")
+async def plex_playing(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
+
+    try:
+        sessions = await fetch_plex_sessions()
+    except Exception as e:
+        await interaction.followup.send(f"Erreur Plex: {e}", ephemeral=True)
+        return
+
+    if not sessions:
+        await interaction.followup.send("Aucune lecture en cours sur Plex.", ephemeral=True)
+        return
+
+    sessions = sessions[:10]
+    lines = ["🎬 **Plex — Now Playing**"]
+
+    for s in sessions:
+        lines.append(
+            f"\n**{s['user']}** — {_pretty_state(s['state'])}\n"
+            f"🎞️ {s['title']}\n"
+            f"⏱️ {s['progress']}\n"
+            f"📺 {s['quality'] or 'n/a'}"
+        )
+
+    msg = "\n".join(lines)
+    if len(msg) > 1900:
+        msg = msg[:1900] + "\n…(tronqué)"
+
+    await interaction.followup.send(msg, ephemeral=True)
+
+
 @bot.tree.command(name="plex_recent", description="Affiche les derniers ajouts Plex (option: bibliothèque)")
 @app_commands.describe(library="Nom ou ID de bibliothèque (ex: Movies, TV Shows, Anime)", limit="Nombre d’items (1-15)")
 async def plex_recent(interaction: discord.Interaction, library: Optional[str] = None, limit: Optional[int] = 10):
@@ -295,63 +392,20 @@ async def plex_recent_library_autocomplete(interaction: discord.Interaction, cur
     except Exception:
         return []
 
-    q = (current or "").lower().strip()
+    q = (current or "").strip()
     choices = []
     for s in sections:
         title = s.get("title", "")
         sid = s.get("id", "")
         if not title:
             continue
-        if not q or q in title.lower() or (sid and q in sid):
-            # Show "Title (id)" to make it easy to pick
+        # match on normalized text so "tvshows" matches "TV Shows"
+        if not q or _norm(q) in _norm(title) or (sid and q.strip() in sid):
             label = f"{title} ({sid})" if sid else title
-            # value should be something we can match; use title
             choices.append(app_commands.Choice(name=label[:100], value=title[:100]))
         if len(choices) >= 25:
             break
     return choices
-
-
-@bot.tree.command(name="plex_playing", description="Affiche ce qui joue présentement sur Plex")
-async def plex_playing(interaction: discord.Interaction):
-    await interaction.response.defer(ephemeral=True)
-
-    try:
-        sessions = await fetch_plex_sessions()
-    except Exception as e:
-        await interaction.followup.send(f"Erreur Plex: {e}", ephemeral=True)
-        return
-
-    if not sessions:
-        await interaction.followup.send("Aucune lecture en cours sur Plex.", ephemeral=True)
-        return
-
-    sessions = sessions[:10]
-    lines = ["🎬 **Plex — Now Playing**"]
-
-    for s in sessions:
-        lines.append(
-            f"\n**{s['user']}** — {_pretty_state(s['state'])}\n"
-            f"🎞️ {s['title']}\n"
-            f"⏱️ {s['progress']}\n"
-            f"📺 {s['quality'] or 'n/a'}"
-        )
-
-    msg = "\n".join(lines)
-    if len(msg) > 1900:
-        msg = msg[:1900] + "\n…(tronqué)"
-
-    await interaction.followup.send(msg, ephemeral=True)
-
-
-@bot.tree.command(name="plex_ping", description="Test PlexBot")
-async def plex_ping(interaction: discord.Interaction):
-    await interaction.response.send_message("PlexBot Pong ✅", ephemeral=True)
-
-
-@bot.tree.command(name="plex_status", description="Statut du bot Plex")
-async def plex_status(interaction: discord.Interaction):
-    await interaction.response.send_message(f"PlexBot Online 🎬 (v{__version__})", ephemeral=True)
 
 
 if __name__ == "__main__":
