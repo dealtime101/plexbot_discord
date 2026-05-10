@@ -14,7 +14,7 @@ import aiohttp
 import discord
 from discord import app_commands
 
-__version__ = "0.4.1"
+__version__ = "0.5.0"
 
 # =========================
 # Env / Config
@@ -28,8 +28,12 @@ PLEX_BASE_URL = (os.environ.get("PLEXBOT_PLEX_BASE_URL") or "http://127.0.0.1:32
 RECENT_SEASON_COLLAPSE_THRESHOLD = int(os.environ.get("PLEXBOT_RECENT_SEASON_COLLAPSE_THRESHOLD") or "5")
 HISTORY_PAGE_SIZE = int(os.environ.get("PLEXBOT_HISTORY_PAGE_SIZE") or "200")
 
+# Forwarding: #plex_request → DM
+REQUEST_CHANNEL_ID = int(os.environ.get("PLEXBOT_REQUEST_CHANNEL_ID") or "1168742200985800765")
+NOTIFY_USER_ID = int(os.environ.get("PLEXBOT_NOTIFY_USER_ID") or "244263181772390400")
+
 if not DISCORD_TOKEN:
-    raise RuntimeError("PLEXBOT_DISCORD_TOKEN manquant (variable d’environnement Windows).")
+    raise RuntimeError("PLEXBOT_DISCORD_TOKEN manquant (variable d'environnement Windows).")
 
 # =========================
 # Logging
@@ -113,7 +117,7 @@ def _rating_badge(r10: Optional[float]) -> Optional[str]:
 # =========================
 async def _plex_get_xml(path: str) -> ET.Element:
     if not PLEX_TOKEN:
-        raise RuntimeError("PLEXBOT_PLEX_TOKEN manquant (variable d’environnement Windows).")
+        raise RuntimeError("PLEXBOT_PLEX_TOKEN manquant (variable d'environnement Windows).")
 
     url = f"{PLEX_BASE_URL}{path}"
     sep = "&" if "?" in url else "?"
@@ -647,7 +651,9 @@ async def fetch_random_item(library: Optional[str] = None) -> Tuple[Optional[ET.
 # =========================
 class PlexBot(discord.Client):
     def __init__(self) -> None:
-        super().__init__(intents=discord.Intents.default())
+        intents = discord.Intents.default()
+        intents.message_content = True
+        super().__init__(intents=intents)
         self.tree = app_commands.CommandTree(self)
 
     async def setup_hook(self) -> None:
@@ -660,6 +666,56 @@ class PlexBot(discord.Client):
 
     async def on_ready(self) -> None:
         log.info("Connecté en tant que %s", self.user)
+        log.info("Forwarding activé : channel %s → user %s", REQUEST_CHANNEL_ID, NOTIFY_USER_ID)
+
+    async def on_message(self, message: discord.Message) -> None:
+        # Ignore les messages du bot lui-même
+        if message.author.bot:
+            return
+
+        # Uniquement le canal #plex_request
+        if message.channel.id != REQUEST_CHANNEL_ID:
+            return
+
+        try:
+            notify_user = await self.fetch_user(NOTIFY_USER_ID)
+        except Exception as e:
+            log.warning("Impossible de récupérer l'utilisateur cible %s: %s", NOTIFY_USER_ID, e)
+            return
+
+        # Construire l'embed de notification
+        embed = discord.Embed(
+            title="📬 Nouvelle demande Plex",
+            description=message.content or "_( message sans texte )_",
+            color=discord.Color.orange(),
+            timestamp=message.created_at,
+        )
+        embed.set_author(
+            name=str(message.author.display_name),
+            icon_url=message.author.display_avatar.url if message.author.display_avatar else None,
+        )
+        embed.add_field(name="📍 Canal", value=f"#{message.channel.name}", inline=True)
+        embed.add_field(name="🏠 Serveur", value=message.guild.name if message.guild else "DM", inline=True)
+
+        # Pièces jointes éventuelles
+        if message.attachments:
+            names = ", ".join(a.filename for a in message.attachments)
+            embed.add_field(name="📎 Pièces jointes", value=names[:1024], inline=False)
+            # Afficher la première image en aperçu si disponible
+            for att in message.attachments:
+                if att.content_type and att.content_type.startswith("image/"):
+                    embed.set_image(url=att.url)
+                    break
+
+        embed.set_footer(text=f"PlexBot v{__version__} • ID message : {message.id}")
+
+        try:
+            await notify_user.send(embed=embed)
+            log.info("Demande forwardée → %s (message ID %s)", notify_user, message.id)
+        except discord.Forbidden:
+            log.warning("Impossible d'envoyer un DM à %s (DMs fermés ?)", notify_user)
+        except Exception as e:
+            log.error("Erreur lors du forwarding DM: %s", e)
 
 
 bot = PlexBot()
@@ -696,6 +752,9 @@ async def plex_help(interaction: discord.Interaction):
             "• `/plex_version` — Bot version",
             "• `/plex_ping` — Bot ping",
             "",
+            "**Automatique**",
+            f"• 📬 Les messages dans **#plex_request** sont forwardés en DM à l'admin",
+            "",
             "**Tips**",
             f"• Season collapse: ≥ **{RECENT_SEASON_COLLAPSE_THRESHOLD} eps**",
         ]
@@ -727,7 +786,7 @@ async def plex_info_cmd(interaction: discord.Interaction, query: str, library: O
         rating_key = m.group(1) if m else ""
 
     if not rating_key:
-        line = _format_search_hit(best) or "Résultat trouvé, mais impossible d’ouvrir le détail."
+        line = _format_search_hit(best) or "Résultat trouvé, mais impossible d'ouvrir le détail."
         await interaction.followup.send(f"{_header('ℹ️ Plex — Info')}\n\n{line}", ephemeral=True)
         return
 
@@ -764,7 +823,7 @@ async def plex_random_cmd(interaction: discord.Interaction, library: Optional[st
 
 
 @bot.tree.command(name="plex_ondeck", description="Continue Watching / On Deck (option: bibliothèque)")
-@app_commands.describe(library="Optionnel: nom de bibliothèque", limit="Nombre d’items (1-15)")
+@app_commands.describe(library="Optionnel: nom de bibliothèque", limit="Nombre d'items (1-15)")
 async def plex_ondeck_cmd(interaction: discord.Interaction, library: Optional[str] = None, limit: Optional[int] = 10):
     await interaction.response.defer(ephemeral=True)
     try:
