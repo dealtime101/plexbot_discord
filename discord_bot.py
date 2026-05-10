@@ -14,7 +14,7 @@ import aiohttp
 import discord
 from discord import app_commands
 
-__version__ = "0.5.0"
+__version__ = "0.6.0"
 
 # =========================
 # Env / Config
@@ -32,6 +32,12 @@ HISTORY_PAGE_SIZE = int(os.environ.get("PLEXBOT_HISTORY_PAGE_SIZE") or "200")
 REQUEST_CHANNEL_ID = int(os.environ.get("PLEXBOT_REQUEST_CHANNEL_ID") or "1168742200985800765")
 NOTIFY_USER_ID = int(os.environ.get("PLEXBOT_NOTIFY_USER_ID") or "244263181772390400")
 
+# TMDB (commande /plex_request)
+TMDB_API_KEY = (os.environ.get("PLEXBOT_TMDB_API_KEY") or "").strip()
+TMDB_LANGUAGE = (os.environ.get("PLEXBOT_TMDB_LANGUAGE") or "fr-FR").strip()
+TMDB_BASE_URL = "https://api.themoviedb.org/3"
+TMDB_IMG_BASE = "https://image.tmdb.org/t/p/w500"
+
 if not DISCORD_TOKEN:
     raise RuntimeError("PLEXBOT_DISCORD_TOKEN manquant (variable d'environnement Windows).")
 
@@ -40,6 +46,9 @@ if not DISCORD_TOKEN:
 # =========================
 logging.basicConfig(level=logging.INFO, format="[%(asctime)s] %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("PlexBot")
+
+if not TMDB_API_KEY:
+    log.warning("PLEXBOT_TMDB_API_KEY non configurée — /plex_request retournera une erreur tant que la clé n'est pas définie.")
 
 
 # =========================
@@ -530,6 +539,190 @@ def _ensure_library_field(embed: discord.Embed, section: str | None) -> None:
     embed.add_field(name="📚 Library", value=section, inline=True)
 
 
+# =========================
+# TMDB (pour /plex_request)
+# =========================
+TMDB_GENRE_MAP_MOVIE = {
+    28: "Action", 12: "Aventure", 16: "Animation", 35: "Comédie",
+    80: "Crime", 99: "Documentaire", 18: "Drame", 10751: "Famille",
+    14: "Fantastique", 36: "Histoire", 27: "Horreur", 10402: "Musique",
+    9648: "Mystère", 10749: "Romance", 878: "Science-Fiction",
+    10770: "Téléfilm", 53: "Thriller", 10752: "Guerre", 37: "Western",
+}
+TMDB_GENRE_MAP_TV = {
+    10759: "Action & Aventure", 16: "Animation", 35: "Comédie",
+    80: "Crime", 99: "Documentaire", 18: "Drame", 10751: "Famille",
+    10762: "Jeunesse", 9648: "Mystère", 10763: "News",
+    10764: "Téléréalité", 10765: "Sci-Fi & Fantasy", 10766: "Soap",
+    10767: "Talk", 10768: "Guerre & Politique", 37: "Western",
+}
+
+
+def _tmdb_title(item: dict) -> str:
+    return _safe(item.get("title")) or _safe(item.get("name")) or "Sans titre"
+
+
+def _tmdb_year(item: dict) -> str:
+    date = _safe(item.get("release_date")) or _safe(item.get("first_air_date"))
+    return date[:4] if len(date) >= 4 else ""
+
+
+def _tmdb_poster_url(item: dict) -> Optional[str]:
+    p = item.get("poster_path")
+    if not p:
+        return None
+    return f"{TMDB_IMG_BASE}{p}"
+
+
+def _tmdb_emoji(item: dict) -> str:
+    return "📺" if item.get("media_type") == "tv" else "🎬"
+
+
+def _tmdb_kind_label(item: dict) -> str:
+    return "Série" if item.get("media_type") == "tv" else "Film"
+
+
+def _tmdb_url(item: dict) -> str:
+    media = "tv" if item.get("media_type") == "tv" else "movie"
+    return f"https://www.themoviedb.org/{media}/{item.get('id')}"
+
+
+def _tmdb_genres(item: dict) -> List[str]:
+    media_type = item.get("media_type", "")
+    ids = item.get("genre_ids") or []
+    mapping = TMDB_GENRE_MAP_TV if media_type == "tv" else TMDB_GENRE_MAP_MOVIE
+    return [mapping[i] for i in ids if i in mapping]
+
+
+async def tmdb_search_multi(query: str) -> List[dict]:
+    if not TMDB_API_KEY:
+        raise RuntimeError("PLEXBOT_TMDB_API_KEY manquant.")
+    q = urllib.parse.quote(query)
+    url = (
+        f"{TMDB_BASE_URL}/search/multi"
+        f"?api_key={TMDB_API_KEY}"
+        f"&language={TMDB_LANGUAGE}"
+        f"&query={q}"
+        f"&include_adult=false"
+        f"&page=1"
+    )
+    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=18)) as session:
+        async with session.get(url) as resp:
+            if resp.status != 200:
+                body = await resp.text()
+                raise RuntimeError(f"TMDB HTTP {resp.status}: {body[:200]}")
+            data = await resp.json()
+    results = data.get("results") or []
+    filtered = [r for r in results if r.get("media_type") in ("movie", "tv")]
+    return filtered[:10]
+
+
+async def _plex_has_title(title: str, year: str = "") -> bool:
+    """Cherche dans Plex et retourne True si match (titre + année à ±1)."""
+    if not PLEX_TOKEN or not title:
+        return False
+    try:
+        hits = await plex_search(query=title, limit=15)
+    except Exception:
+        return False
+    qn = _norm(title)
+    for el in hits:
+        t = _safe(el.get("title")) or _safe(el.get("grandparentTitle"))
+        if not t or _norm(t) != qn:
+            continue
+        if year:
+            ey = _safe(el.get("year"))
+            if not ey:
+                avail = _safe(el.get("originallyAvailableAt"))
+                ey = avail[:4] if len(avail) >= 4 else ""
+            try:
+                if ey and abs(int(ey) - int(year)) > 1:
+                    continue
+            except ValueError:
+                pass
+        return True
+    return False
+
+
+def _tmdb_preview_embed(item: dict, idx: int, total: int, *, plex_match: bool = False) -> discord.Embed:
+    title = _tmdb_title(item)
+    year = _tmdb_year(item)
+    emoji = _tmdb_emoji(item)
+    display = f"{title} ({year})" if year else title
+
+    embed = discord.Embed(
+        title=f"{emoji} {_header('Plex Request — Aperçu')}",
+        description=f"**{display}**",
+        url=_tmdb_url(item),
+        color=discord.Color.blurple(),
+    )
+    embed.add_field(name="🏷️ Type", value=_tmdb_kind_label(item), inline=True)
+
+    rating = _to_float(item.get("vote_average"))
+    badge = _rating_badge(rating)
+    if badge:
+        embed.add_field(name="⭐ Note TMDB", value=badge, inline=True)
+
+    genres = _tmdb_genres(item)
+    if genres:
+        embed.add_field(name="🎭 Genres", value=", ".join(genres)[:1024], inline=False)
+
+    overview = _safe(item.get("overview"))
+    if overview:
+        embed.add_field(name="📝 Résumé", value=overview[:1024], inline=False)
+
+    if plex_match:
+        embed.add_field(
+            name="⚠️ Déjà sur Plex",
+            value="Ce titre semble déjà disponible. Tu peux quand même confirmer (autre saison/qualité) ou passer au suivant.",
+            inline=False,
+        )
+
+    poster = _tmdb_poster_url(item)
+    if poster:
+        embed.set_image(url=poster)
+        embed.set_thumbnail(url=poster)
+
+    embed.set_footer(text=f"Résultat {idx + 1}/{total} • PlexBot v{__version__}")
+    return embed
+
+
+def _tmdb_official_embed(item: dict, requester: discord.abc.User) -> discord.Embed:
+    title = _tmdb_title(item)
+    year = _tmdb_year(item)
+    emoji = _tmdb_emoji(item)
+    display = f"{title} ({year})" if year else title
+
+    embed = discord.Embed(
+        title=f"{emoji} {display}",
+        description=_safe(item.get("overview")) or None,
+        url=_tmdb_url(item),
+        color=discord.Color.green(),
+        timestamp=discord.utils.utcnow(),
+    )
+    embed.add_field(name="🏷️ Type", value=_tmdb_kind_label(item), inline=True)
+
+    rating = _to_float(item.get("vote_average"))
+    badge = _rating_badge(rating)
+    if badge:
+        embed.add_field(name="⭐ Note TMDB", value=badge, inline=True)
+
+    genres = _tmdb_genres(item)
+    if genres:
+        embed.add_field(name="🎭 Genres", value=", ".join(genres)[:1024], inline=False)
+
+    poster = _tmdb_poster_url(item)
+    if poster:
+        embed.set_image(url=poster)
+
+    avatar = requester.display_avatar.url if getattr(requester, "display_avatar", None) else None
+    embed.set_footer(
+        text=f"Demandé par {requester.display_name} • PlexBot v{__version__}",
+        icon_url=avatar,
+    )
+    return embed
+
+
 def _metadata_to_embed(el: ET.Element, *, title_override: Optional[str] = None, library_override: Optional[str] = None) -> discord.Embed:
     mtype = _safe(el.get("type"))
     title = _safe(el.get("title"))
@@ -718,6 +911,97 @@ class PlexBot(discord.Client):
             log.error("Erreur lors du forwarding DM: %s", e)
 
 
+class PlexRequestView(discord.ui.View):
+    def __init__(self, results: List[dict], requester: discord.abc.User, *, channel_id: int):
+        super().__init__(timeout=180)
+        self.results = results
+        self.requester = requester
+        self.channel_id = channel_id
+        self.index = 0
+        self.plex_cache: Dict[int, bool] = {}
+        self.message: Optional[discord.Message] = None
+
+    async def interaction_check(self, itx: discord.Interaction) -> bool:
+        if itx.user.id != self.requester.id:
+            await itx.response.send_message("Cette demande n'est pas la tienne.", ephemeral=True)
+            return False
+        return True
+
+    async def _build_current_embed(self) -> discord.Embed:
+        item = self.results[self.index]
+        tmdb_id = item.get("id")
+        if tmdb_id is not None and tmdb_id not in self.plex_cache:
+            self.plex_cache[tmdb_id] = await _plex_has_title(_tmdb_title(item), _tmdb_year(item))
+        return _tmdb_preview_embed(
+            item, self.index, len(self.results),
+            plex_match=self.plex_cache.get(tmdb_id, False),
+        )
+
+    @discord.ui.button(label="Match", style=discord.ButtonStyle.success, emoji="✅")
+    async def match_btn(self, itx: discord.Interaction, button: discord.ui.Button):
+        item = self.results[self.index]
+        try:
+            channel = itx.client.get_channel(self.channel_id) or await itx.client.fetch_channel(self.channel_id)
+        except Exception as e:
+            await itx.response.edit_message(
+                content=f"❌ Canal introuvable : {e}", embed=None, view=None,
+            )
+            self.stop()
+            return
+
+        official_embed = _tmdb_official_embed(item, self.requester)
+        try:
+            await channel.send(
+                content=f"<@{NOTIFY_USER_ID}> Nouvelle demande de {self.requester.mention}",
+                embed=official_embed,
+            )
+        except discord.Forbidden:
+            await itx.response.edit_message(
+                content=f"❌ Le bot n'a pas la permission de poster dans <#{self.channel_id}>.",
+                embed=None, view=None,
+            )
+            self.stop()
+            return
+        except Exception as e:
+            await itx.response.edit_message(
+                content=f"❌ Erreur en publiant la demande : {e}", embed=None, view=None,
+            )
+            self.stop()
+            return
+
+        await itx.response.edit_message(
+            content=f"✅ Demande envoyée dans <#{self.channel_id}>.",
+            embed=None, view=None,
+        )
+        self.stop()
+
+    @discord.ui.button(label="Suivant", style=discord.ButtonStyle.primary, emoji="➡️")
+    async def next_btn(self, itx: discord.Interaction, button: discord.ui.Button):
+        self.index = (self.index + 1) % len(self.results)
+        try:
+            embed = await self._build_current_embed()
+        except Exception as e:
+            await itx.response.edit_message(content=f"❌ Erreur : {e}", embed=None, view=None)
+            self.stop()
+            return
+        await itx.response.edit_message(embed=embed, view=self)
+
+    @discord.ui.button(label="Annuler", style=discord.ButtonStyle.danger, emoji="✖️")
+    async def cancel_btn(self, itx: discord.Interaction, button: discord.ui.Button):
+        await itx.response.edit_message(content="✖️ Demande annulée.", embed=None, view=None)
+        self.stop()
+
+    async def on_timeout(self) -> None:
+        for child in self.children:
+            if hasattr(child, "disabled"):
+                child.disabled = True
+        if self.message:
+            try:
+                await self.message.edit(view=self)
+            except Exception:
+                pass
+
+
 bot = PlexBot()
 
 
@@ -751,6 +1035,9 @@ async def plex_help(interaction: discord.Interaction):
             "• `/plex_library_stats` — Library item counts",
             "• `/plex_version` — Bot version",
             "• `/plex_ping` — Bot ping",
+            "",
+            "**Demande**",
+            "• `/plex_request <titre>` — Demander un film ou une série (preview TMDB + boutons)",
             "",
             "**Automatique**",
             f"• 📬 Les messages dans **#plex_request** sont forwardés en DM à l'admin",
@@ -848,6 +1135,56 @@ async def plex_ondeck_cmd(interaction: discord.Interaction, library: Optional[st
 
     msg = "\n".join([title, "", *[f"• {x}" for x in items]])
     await interaction.followup.send(msg[:1900] + ("\n…(tronqué)" if len(msg) > 1900 else ""), ephemeral=True)
+
+
+@bot.tree.command(name="plex_request", description="Demander un film ou une série à ajouter à Plex")
+@app_commands.describe(titre="Titre du film ou de la série")
+async def plex_request_cmd(interaction: discord.Interaction, titre: str):
+    await interaction.response.defer(ephemeral=True)
+
+    titre = (titre or "").strip()
+    if not titre:
+        await interaction.followup.send(
+            f"{_header('🔍 Plex Request')}\n\nDonne un titre, par ex. `/plex_request goldeneye`.",
+            ephemeral=True,
+        )
+        return
+
+    if not TMDB_API_KEY:
+        await interaction.followup.send(
+            f"{_header('❌ Plex Request')}\n\n`PLEXBOT_TMDB_API_KEY` n'est pas configurée. Préviens l'admin.",
+            ephemeral=True,
+        )
+        return
+
+    try:
+        results = await tmdb_search_multi(titre)
+    except Exception as e:
+        await interaction.followup.send(
+            f"{_header('❌ Plex Request — Error')}\n\nErreur TMDB : {e}",
+            ephemeral=True,
+        )
+        return
+
+    if not results:
+        await interaction.followup.send(
+            f"{_header('🔍 Plex Request')}\n\nAucun résultat pour `{titre}`. Essaye une autre orthographe.",
+            ephemeral=True,
+        )
+        return
+
+    view = PlexRequestView(results, interaction.user, channel_id=REQUEST_CHANNEL_ID)
+    try:
+        embed = await view._build_current_embed()
+    except Exception as e:
+        await interaction.followup.send(
+            f"{_header('❌ Plex Request — Error')}\n\nErreur : {e}",
+            ephemeral=True,
+        )
+        return
+
+    msg = await interaction.followup.send(embed=embed, view=view, ephemeral=True)
+    view.message = msg
 
 
 if __name__ == "__main__":
