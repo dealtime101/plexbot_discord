@@ -14,7 +14,7 @@ import aiohttp
 import discord
 from discord import app_commands
 
-__version__ = "0.6.0"
+__version__ = "0.6.1"
 
 # =========================
 # Env / Config
@@ -1026,7 +1026,6 @@ async def plex_help(interaction: discord.Interaction):
         [
             "**Core**",
             "• `/plex_status` — Bot status",
-            "• `/plex_playing` — Now playing sessions",
             "• `/plex_recent` — Recently added (library filter + season collapse)",
             "• `/plex_search` — Search in Plex",
             "• `/plex_info` — Info (poster + rating stars)",
@@ -1135,6 +1134,165 @@ async def plex_ondeck_cmd(interaction: discord.Interaction, library: Optional[st
 
     msg = "\n".join([title, "", *[f"• {x}" for x in items]])
     await interaction.followup.send(msg[:1900] + ("\n…(tronqué)" if len(msg) > 1900 else ""), ephemeral=True)
+
+
+@bot.tree.command(name="plex_recent", description="Ajouts récents sur Plex (option: bibliothèque, limite)")
+@app_commands.describe(
+    library="Optionnel: nom de bibliothèque (ex: Films, Anime, Séries)",
+    limit="Nombre d'items à afficher (1-25, défaut 10)",
+)
+async def plex_recent_cmd(
+    interaction: discord.Interaction,
+    library: Optional[str] = None,
+    limit: Optional[int] = 10,
+):
+    await interaction.response.defer(ephemeral=True)
+    try:
+        n = int(limit) if limit is not None else 10
+    except Exception:
+        n = 10
+    n = max(1, min(25, n))
+
+    try:
+        items = await fetch_recently_added(limit=n, library=library)
+    except Exception as e:
+        await interaction.followup.send(
+            f"{_header('❌ Plex — Error')}\n\nErreur Plex: {e}",
+            ephemeral=True,
+        )
+        return
+
+    title = _header("🆕 Plex — Recently Added")
+    if library:
+        title += f" _(filter: {library})_"
+
+    if not items:
+        await interaction.followup.send(f"{title}\n\nAucun ajout récent.", ephemeral=True)
+        return
+
+    msg = "\n".join([title, "", *[f"• {x}" for x in items]])
+    await interaction.followup.send(
+        msg[:1900] + ("\n…(tronqué)" if len(msg) > 1900 else ""),
+        ephemeral=True,
+    )
+
+
+@bot.tree.command(name="plex_search", description="Chercher un film / série / épisode dans Plex")
+@app_commands.describe(
+    query="Titre à chercher",
+    library="Optionnel: nom de bibliothèque",
+    limit="Nombre de résultats (1-25, défaut 10)",
+)
+async def plex_search_cmd(
+    interaction: discord.Interaction,
+    query: str,
+    library: Optional[str] = None,
+    limit: Optional[int] = 10,
+):
+    await interaction.response.defer(ephemeral=True)
+
+    query = (query or "").strip()
+    if not query:
+        await interaction.followup.send(
+            f"{_header('🔍 Plex — Search')}\n\nDonne un terme de recherche.",
+            ephemeral=True,
+        )
+        return
+
+    try:
+        n = int(limit) if limit is not None else 10
+    except Exception:
+        n = 10
+    n = max(1, min(25, n))
+
+    try:
+        hits = await plex_search(query=query, limit=n, library=library)
+    except Exception as e:
+        await interaction.followup.send(
+            f"{_header('❌ Plex — Error')}\n\nErreur Plex: {e}",
+            ephemeral=True,
+        )
+        return
+
+    title = _header(f"🔍 Plex — Search: {query}")
+    if library:
+        title += f" _(filter: {library})_"
+
+    if not hits:
+        await interaction.followup.send(f"{title}\n\nAucun résultat pour: **{query}**", ephemeral=True)
+        return
+
+    lines = [_format_search_hit(el) for el in hits]
+    lines = [x for x in lines if x]
+
+    if not lines:
+        await interaction.followup.send(
+            f"{title}\n\nRésultats trouvés mais format inconnu.",
+            ephemeral=True,
+        )
+        return
+
+    msg = "\n".join([title, f"_Résultats pour « {query} »_", "", *[f"• {x}" for x in lines]])
+    await interaction.followup.send(
+        msg[:1900] + ("\n…(tronqué)" if len(msg) > 1900 else ""),
+        ephemeral=True,
+    )
+
+
+@bot.tree.command(name="plex_library_stats", description="Nombre d'items par bibliothèque Plex")
+async def plex_library_stats_cmd(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
+    try:
+        stats = await fetch_library_stats()
+    except Exception as e:
+        await interaction.followup.send(
+            f"{_header('❌ Plex — Error')}\n\nErreur Plex: {e}",
+            ephemeral=True,
+        )
+        return
+
+    if not stats:
+        await interaction.followup.send(
+            f"{_header('📚 Plex — Library Stats')}\n\nAucune bibliothèque détectée.",
+            ephemeral=True,
+        )
+        return
+
+    embed = discord.Embed(
+        title=f"📚 Plex — Library Stats  _(v{__version__})_",
+        color=discord.Color.blurple(),
+    )
+    total = 0
+    for lib_name, count in stats:
+        embed.add_field(name=f"📁 {lib_name}", value=f"`{count:,}` items", inline=True)
+        total += count
+    embed.set_footer(text=f"Total: {total:,} items • PlexBot v{__version__}")
+    await interaction.followup.send(embed=embed, ephemeral=True)
+
+
+@bot.tree.command(name="plex_playing", description="Sessions en cours de lecture sur Plex")
+async def plex_playing_cmd(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
+    try:
+        sessions = await fetch_plex_sessions()
+    except Exception as e:
+        await interaction.followup.send(f"{_header('❌ Plex — Error')}\n\nErreur Plex: {e}", ephemeral=True)
+        return
+
+    title = _header("🎶 Plex — Now Playing")
+    if not sessions:
+        await interaction.followup.send(f"{title}\n\nAucune lecture en cours.", ephemeral=True)
+        return
+
+    embed = discord.Embed(title="🎶 Plex — Now Playing", description=f"_{len(sessions)} session(s) active(s)_")
+    for s in sessions:
+        state_emoji = "▶️" if s.get("state") == "playing" else "⏸️"
+        name = f"{state_emoji} {s.get('user', 'Unknown')}"
+        quality = s.get("quality", "")
+        value = f"**{s.get('title', '?')}**\n{s.get('progress', '')}  _({quality})_" if quality else f"**{s.get('title', '?')}**\n{s.get('progress', '')}"
+        embed.add_field(name=name, value=value[:1024], inline=False)
+    embed.set_footer(text=f"PlexBot v{__version__}")
+    await interaction.followup.send(embed=embed, ephemeral=True)
 
 
 @bot.tree.command(name="plex_request", description="Demander un film ou une série à ajouter à Plex")
